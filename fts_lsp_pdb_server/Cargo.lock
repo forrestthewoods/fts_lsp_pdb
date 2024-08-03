@@ -99,7 +99,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "fts_pdb_lsp"
+name = "fts_lsp_pdb_server"
 version = "0.1.0"
 dependencies = [
  "anyhow",

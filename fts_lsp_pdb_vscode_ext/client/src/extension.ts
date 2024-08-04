@@ -47,8 +47,28 @@ export function activate(context: ExtensionContext) {
 		clientOptions
 	);
 
+	// Set up configuration change listener
+	context.subscriptions.push(
+		workspace.onDidChangeConfiguration(e => {
+			if (e.affectsConfiguration('fts_lsp_pdb')) {
+				const config = workspace.getConfiguration('fts_lsp_pdb');
+				client.sendNotification('workspace/didChangeConfiguration', {
+					exes: config.get('exes'),
+					pdbs: config.get('pdbs')
+				  });
+			}
+		})
+	);
+
 	// Start the client. This will also launch the server
 	client.start();
+
+	// send config data
+	const config = workspace.getConfiguration('fts_lsp_pdb');
+	client.sendNotification('workspace/didChangeConfiguration', {
+		exes: config.get('exes'),
+		pdbs: config.get('pdbs')
+	  });
 }
 
 export function deactivate(): Thenable<void> | undefined {

@@ -1,5 +1,5 @@
 {
-	"name": "lsp-sample",
+	"name": "fts_lsp_pdb",
 	"description": "A language server example",
 	"author": "Microsoft Corporation",
 	"license": "MIT",
@@ -23,24 +23,17 @@
 	"contributes": {
 		"configuration": {
 			"type": "object",
-			"title": "Example configuration",
+			"title": "fts_lsp_pdb",
 			"properties": {
-				"languageServerExample.maxNumberOfProblems": {
-					"scope": "resource",
-					"type": "number",
-					"default": 100,
-					"description": "Controls the maximum number of problems produced by the server."
+				"fts_lsp_pdb.exes": {
+					"type": "array",
+					"default": [],
+					"description": "Array of paths to executables"
 				},
-				"languageServerExample.trace.server": {
-					"scope": "window",
-					"type": "string",
-					"enum": [
-						"off",
-						"messages",
-						"verbose"
-					],
-					"default": "off",
-					"description": "Traces the communication between VS Code and the language server."
+				"fts_lsp_pdb.pdbs": {
+					"type": "array",
+					"default": [],
+					"description": "Array of paths to PDBs"
 				}
 			}
 		}
@@ -50,7 +43,7 @@
 		"compile": "tsc -b",
 		"watch": "tsc -b -w",
 		"lint": "eslint ./client/src ./server/src --ext .ts,.tsx",
-		"postinstall": "cd client && npm install && cd ../server && npm install && cd ..",
+		"postinstall": "cd client && npm install",
 		"test": "sh ./scripts/e2e.sh"
 	},
 	"devDependencies": {

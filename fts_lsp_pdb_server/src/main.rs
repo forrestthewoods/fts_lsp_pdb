@@ -16,6 +16,12 @@ use symbolic::debuginfo::Archive;
 use symbolic::symcache::{SymCache, SymCacheConverter};
 use tokio::runtime::Runtime;
 
+#[derive(Default, serde::Deserialize)]
+struct Config {
+    exes: Vec<PathBuf>,
+    pdbs: Vec<PathBuf>
+}
+
 fn main() {
     let rt = Runtime::new().unwrap();
     rt.block_on(async {
@@ -43,14 +49,25 @@ fn main() {
         connection.initialize_finish(initialize_id, initialize_result_value).unwrap();
 
         // Main message loop
+        let mut config : Config = Default::default();
         for msg in &connection.receiver {
             match msg {
                 Message::Request(req) => {
                     if connection.handle_shutdown(&req).unwrap() {
                         return;
                     }
-                    handle_request(req, &connection).await;
-                }
+                    handle_request(req, &connection, &config).await;
+                },
+                Message::Notification(notif) => {
+                    match notif.method.as_str() {
+                        "workspace/didChangeConfiguration" => {
+                            if let Ok(c) = serde_json::from_value::<Config>(notif.params) {
+                                config = c;
+                            }
+                        },
+                        _ => {}
+                    }
+                },
                 _ => {}
             }
         }
@@ -60,21 +77,23 @@ fn main() {
     });
 }
 
-async fn handle_request(req: Request, connection: &Connection) {
+async fn handle_request(req: Request, connection: &Connection, config: &Config) {
     if let Ok((id, params)) = req.extract::<GotoDefinitionParams>("textDocument/definition") {
-        let response = goto_definition(params).await;
+        let response = goto_definition(params, config).await;
         let resp = Response::new_ok(id, response.ok());
         connection.sender.send(Message::Response(resp)).unwrap();
     }
 }
 
-async fn goto_definition(params: GotoDefinitionParams) -> anyhow::Result<GotoDefinitionResponse> {
+async fn goto_definition(params: GotoDefinitionParams, config: &Config) -> anyhow::Result<GotoDefinitionResponse> {
     let mut debug_log = std::fs::OpenOptions::new().create(true).append(true).open("c:/temp/hack_log.txt")?;
 
     // HACK: hardcoded for testing
     // Paths to the EXE and PDB files
-    let exe_path = "C:/temp/code/cpp/scratch/x64/Debug/scratch.exe";
-    let pdb_path = "C:/temp/code/cpp/scratch/x64/Debug/scratch.pdb";
+    //let exe_path = "C:/temp/code/cpp/scratch/x64/Debug/scratch.exe";
+    //let pdb_path = "C:/temp/code/cpp/scratch/x64/Debug/scratch.pdb";
+    let exe_path = &config.exes[0];
+    let pdb_path = &config.pdbs[0];
 
     let uri = params.text_document_position_params.text_document.uri;
     let filepath = uri.to_file_path().ok().ok_or_else(|| anyhow!("Couldn't get filepath from [{:?}]", uri))?;
@@ -326,7 +345,7 @@ async fn _goto_definition_old(params: GotoDefinitionParams) -> Option<GotoDefini
     Some(GotoDefinitionResponse::Scalar(location))
 }
 
-fn map_address_to_file_and_line(path: &str, address: u64) -> anyhow::Result<(String, u32)> {
+fn map_address_to_file_and_line(path: &Path, address: u64) -> anyhow::Result<(String, u32)> {
     let pb: PathBuf = path.into();
     let dsym_path = pb.resolve_dsym();
     let byteview = ByteView::open(dsym_path.as_deref().unwrap_or_else(|| pb.as_ref()))?;

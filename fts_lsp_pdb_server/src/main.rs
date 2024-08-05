@@ -19,7 +19,7 @@ use tokio::runtime::Runtime;
 #[derive(Default, serde::Deserialize)]
 struct Config {
     exes: Vec<PathBuf>,
-    pdbs: Vec<PathBuf>
+    pdbs: Vec<PathBuf>,
 }
 
 fn main() {
@@ -49,7 +49,7 @@ fn main() {
         connection.initialize_finish(initialize_id, initialize_result_value).unwrap();
 
         // Main message loop
-        let mut config : Config = Default::default();
+        let mut config: Config = Default::default();
         for msg in &connection.receiver {
             match msg {
                 Message::Request(req) => {
@@ -57,16 +57,14 @@ fn main() {
                         return;
                     }
                     handle_request(req, &connection, &config).await;
-                },
-                Message::Notification(notif) => {
-                    match notif.method.as_str() {
-                        "workspace/didChangeConfiguration" => {
-                            if let Ok(c) = serde_json::from_value::<Config>(notif.params) {
-                                config = c;
-                            }
-                        },
-                        _ => {}
+                }
+                Message::Notification(notif) => match notif.method.as_str() {
+                    "workspace/didChangeConfiguration" => {
+                        if let Ok(c) = serde_json::from_value::<Config>(notif.params) {
+                            config = c;
+                        }
                     }
+                    _ => {}
                 },
                 _ => {}
             }
@@ -75,6 +73,92 @@ fn main() {
         // Shut down IO threads
         io_threads.join().unwrap();
     });
+}
+
+struct Cache<'a> {
+    exe_cache: ExeCache<'a>,
+}
+
+struct ExeCache<'a> {
+    exe_path: PathBuf,
+    exe_bytes: Vec<u8>,
+    exe_parsed: goblin::pe::PE<'a>,
+    exe_capstone: capstone::Capstone,
+    exe_instructions: capstone::Instructions<'a>,
+    exe_instructions_sorted: HashMap<u64, &'a capstone::Insn<'a>>,
+
+    pdb: pdb::PDB<'a, File>,
+    files: HashMap<String, HashMap<u32, pdb::LineInfo>>,
+}
+
+fn _cache_config(config: &Config, cache: &mut Cache) -> anyhow::Result<()> {
+    cache.exe_cache.exe_path = config.exes[0].clone();
+    cache.exe_cache.exe_bytes = std::fs::read(&cache.exe_cache.exe_path)?;
+
+    // Parse EXE
+    // unsafe: rust is stupid
+    unsafe {
+        let ptr = cache.exe_cache.exe_bytes.as_ptr();
+        let len = cache.exe_cache.exe_bytes.len();
+        let slice = std::slice::from_raw_parts(ptr, len);
+        cache.exe_cache.exe_parsed = PE::parse(slice)?;
+    }
+
+    cache.exe_cache.exe_capstone = Capstone::new().x86().mode(arch::x86::ArchMode::Mode64).build()?;
+    let text_section = cache
+        .exe_cache
+        .exe_parsed
+        .sections
+        .iter()
+        .find(|s| s.name().unwrap() == ".text")
+        .ok_or_else(|| anyhow!("Could not find text section"))?;
+    let bytes = &cache.exe_cache.exe_bytes[text_section.pointer_to_raw_data as usize..text_section.size_of_raw_data as usize];
+    cache.exe_cache.exe_instructions = cache.exe_cache.exe_capstone.disasm_all(bytes, text_section.virtual_address as u64)?;
+
+    for inst in cache.exe_cache.exe_instructions.iter() {
+        cache.exe_cache.exe_instructions_sorted.insert(inst.address(), inst);
+    }
+
+    // Parse and cache PDB
+    let pdb_file = File::open(&config.pdbs[0])?;
+    cache.exe_cache.pdb = PDB::open(pdb_file)?;
+
+    let pdb = &mut cache.exe_cache.pdb;
+    let di = pdb.debug_information()?;
+    let string_table = pdb.string_table()?;
+    let mut modules = di.modules()?;
+
+    let mut file_name_lower: HashMap<pdb::RawString, String> = Default::default();
+    while let Some(module) = modules.next()? {
+        let info = pdb.module_info(&module)?.unwrap();
+        let line_program = info.line_program()?;
+
+        let mut lines = line_program.lines();
+        while let Some(line) = lines.next()? {
+            let file_info = line_program.get_file_info(line.file_index)?;
+            let file_name = string_table.get(file_info.name)?;
+
+            // Try to ensure entry
+            if !file_name_lower.contains_key(&file_name) {
+                if let Ok(pb) = PathBuf::from_str(&file_name.to_string()) {
+                    if let Some(lower) = pb.to_str().and_then(|s| Some(s.to_lowercase())) {
+                        file_name_lower.insert(file_name, lower);
+                    }
+                }
+            }
+
+            if let Some(lower) = file_name_lower.get(&file_name) {
+                if !cache.exe_cache.files.contains_key(lower) {
+                    cache.exe_cache.files.insert(lower.clone(), Default::default());
+                }
+
+                let files = cache.exe_cache.files.get_mut(lower).unwrap();
+                files.insert(line.line_start, line);
+            }
+        }
+    }
+
+    Ok(())
 }
 
 async fn handle_request(req: Request, connection: &Connection, config: &Config) {
@@ -88,10 +172,9 @@ async fn handle_request(req: Request, connection: &Connection, config: &Config) 
 async fn goto_definition(params: GotoDefinitionParams, config: &Config) -> anyhow::Result<GotoDefinitionResponse> {
     let mut debug_log = std::fs::OpenOptions::new().create(true).append(true).open("c:/temp/hack_log.txt")?;
 
-    // HACK: hardcoded for testing
-    // Paths to the EXE and PDB files
-    //let exe_path = "C:/temp/code/cpp/scratch/x64/Debug/scratch.exe";
-    //let pdb_path = "C:/temp/code/cpp/scratch/x64/Debug/scratch.pdb";
+    if config.exes.len() == 0 || config.pdbs.len() == 0 {
+        anyhow::bail!("Empty config");
+    }
     let exe_path = &config.exes[0];
     let pdb_path = &config.pdbs[0];
 
@@ -159,7 +242,7 @@ async fn goto_definition(params: GotoDefinitionParams, config: &Config) -> anyho
         .ok_or_else(|| anyhow!("Could not find text section"))?;
     let bytes = &exe_data[text_section.pointer_to_raw_data as usize..text_section.size_of_raw_data as usize];
     let all_exe_instructions = cs.disasm_all(bytes, text_section.virtual_address as u64)?;
-    let exe_instruction_map: HashMap<_, _> = all_exe_instructions.iter().map(|inst| (inst.address(), inst)).collect();
+    let exe_instruction_map: HashMap<u64, _> = all_exe_instructions.iter().map(|inst| (inst.address(), inst)).collect();
 
     let mut result: Vec<(String, u32)> = Default::default();
 
@@ -222,8 +305,8 @@ async fn goto_definition(params: GotoDefinitionParams, config: &Config) -> anyho
         let file = &result[0].0;
         let pos = Position::new(result[0].1 - 1, 0); // lines start at 0?
         let uri = url::Url::from_file_path(&file)
-        .ok()
-        .ok_or_else(|| anyhow!("Could not create URL from [{:?}]", file))?;
+            .ok()
+            .ok_or_else(|| anyhow!("Could not create URL from [{:?}]", file))?;
 
         let location = lsp_types::Location {
             uri: uri,
@@ -250,99 +333,6 @@ async fn goto_definition(params: GotoDefinitionParams, config: &Config) -> anyho
 
         return Ok(GotoDefinitionResponse::Array(locations));
     }
-}
-
-async fn _goto_definition_old(params: GotoDefinitionParams) -> Option<GotoDefinitionResponse> {
-    // debug log
-    let mut debug_log = std::fs::OpenOptions::new().create(true).append(true).open("c:/temp/hack_log.txt").ok()?;
-
-    let uri = params.text_document_position_params.text_document.uri;
-    let position = params.text_document_position_params.position;
-
-    // Get the line
-    // Why does LSP not just give it to us!?
-    let filepath = uri.to_file_path().ok()?;
-    let file = std::fs::File::open(&filepath).ok()?;
-    let reader = std::io::BufReader::new(&file);
-    let line = reader.lines().skip(position.line as usize).next()?.ok()?;
-
-    // Determine symbol
-    let chars: Vec<char> = line.chars().collect();
-    let mut start = position.character as usize;
-
-    let is_symbol_char = |c: char| c.is_alphanumeric() || c == '_';
-    if !is_symbol_char(chars[start]) {
-        return None;
-    }
-
-    loop {
-        if !is_symbol_char(chars[start as usize]) {
-            start += 1;
-            break;
-        } else {
-            if start == 0 {
-                break;
-            }
-            start -= 1;
-        }
-    }
-
-    let mut end = start + 1;
-    while end < chars.len() && is_symbol_char(chars[end]) {
-        end += 1;
-    }
-
-    let symbol: String = chars.iter().skip(start).take(end - start).collect();
-    debug_log.write_all(symbol.as_bytes()).ok()?;
-    debug_log.write_all("\n".as_bytes()).ok()?;
-
-    // Run child process
-    // Define the command and arguments you want to run
-    let result = std::process::Command::new("C:/temp/code/github/raddebugger/build/rdi_lsp.exe")
-        .arg(format!("--goto_definition={symbol}"))
-        .arg("C:/source_control/fts_gamemath_jai/src/scratch3.rdi")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn();
-
-    let child = result.ok()?;
-
-    // Capture the stdout
-    let output = child.wait_with_output().ok()?;
-
-    // Check if the command was successful
-    if !output.status.success() {
-        return None;
-    }
-
-    // Convert the stdout to a String
-    let stdout = String::from_utf8(output.stdout).ok()?;
-    debug_log.write_all("stdout: ".as_bytes()).ok()?;
-    debug_log.write_all(stdout.as_bytes()).ok()?;
-    debug_log.write_all("/n".as_bytes()).ok()?;
-
-    let stderr = String::from_utf8(output.stderr).ok()?;
-    debug_log.write_all("stderr: ".as_bytes()).ok()?;
-    debug_log.write_all(stderr.as_bytes()).ok()?;
-    debug_log.write_all("/n".as_bytes()).ok()?;
-
-    let parts: Vec<_> = stdout.split(';').collect();
-    if parts.len() != 2 {
-        return None;
-    }
-
-    let line: u32 = parts[0].parse().ok()?;
-    let pos = Position::new(line, 0);
-
-    let filepath: std::path::PathBuf = parts[1].into();
-    let file_url = url::Url::from_file_path(&filepath).ok()?;
-
-    let location = lsp_types::Location {
-        uri: file_url,
-        range: lsp_types::Range { start: pos, end: pos },
-    };
-
-    Some(GotoDefinitionResponse::Scalar(location))
 }
 
 fn map_address_to_file_and_line(path: &Path, address: u64) -> anyhow::Result<(String, u32)> {

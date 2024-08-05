@@ -84,6 +84,8 @@ struct ExeCache<'a> {
     exe_parsed: goblin::pe::PE<'a>,
     exe_capstone: capstone::Capstone,
     exe_instructions: capstone::Instructions<'a>,
+    exe_instructions2: &'a [capstone::Insn<'a>],
+    exe_instructions3: (* const capstone::Insn<'a>, usize),
     exe_instructions_sorted: HashMap<u64, &'a capstone::Insn<'a>>,
 
     pdb: pdb::PDB<'a, File>,
@@ -118,6 +120,8 @@ fn _cache_config(config: &Config, cache: &mut Cache) -> anyhow::Result<()> {
     unsafe { 
         let mut y : &[capstone::Insn] = Default::default();
         y = std::slice::from_raw_parts(x.as_ptr(), x.len());
+        //cache.exe_cache.exe_instructions2 = std::slice::from_raw_parts(x.as_ptr(), x.len());
+        cache.exe_cache.exe_instructions3 = (x.as_ptr(), x.len());
         //cache.exe_cache.exe_instructions = 
     }
     //cache.exe_cache.exe_instructions = cache.exe_cache.exe_capstone.disasm_all(bytes, text_section.virtual_address as u64)?;

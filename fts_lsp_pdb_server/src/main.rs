@@ -7,9 +7,8 @@ use normpath::PathExt;
 use pdb::{FallibleIterator, PDB};
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufRead, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::str::FromStr;
 use symbolic::common::{ByteView, DSymPathExt};
 use symbolic::debuginfo::Archive;
@@ -113,7 +112,15 @@ fn _cache_config(config: &Config, cache: &mut Cache) -> anyhow::Result<()> {
         .find(|s| s.name().unwrap() == ".text")
         .ok_or_else(|| anyhow!("Could not find text section"))?;
     let bytes = &cache.exe_cache.exe_bytes[text_section.pointer_to_raw_data as usize..text_section.size_of_raw_data as usize];
-    cache.exe_cache.exe_instructions = cache.exe_cache.exe_capstone.disasm_all(bytes, text_section.virtual_address as u64)?;
+    let x = cache.exe_cache.exe_capstone.disasm_all(bytes, text_section.virtual_address as u64)?;
+    let p = x.as_ptr();
+    let l = x.len();
+    unsafe { 
+        let mut y : &[capstone::Insn] = Default::default();
+        y = std::slice::from_raw_parts(x.as_ptr(), x.len());
+        //cache.exe_cache.exe_instructions = 
+    }
+    //cache.exe_cache.exe_instructions = cache.exe_cache.exe_capstone.disasm_all(bytes, text_section.virtual_address as u64)?;
 
     for inst in cache.exe_cache.exe_instructions.iter() {
         cache.exe_cache.exe_instructions_sorted.insert(inst.address(), inst);

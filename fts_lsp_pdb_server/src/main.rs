@@ -5,6 +5,7 @@ use lsp_server::{Connection, Message, Request, Response};
 use lsp_types::{GotoDefinitionParams, GotoDefinitionResponse, InitializeResult, Position, ServerCapabilities};
 use normpath::PathExt;
 use pdb::{FallibleIterator, PDB};
+use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
@@ -21,6 +22,43 @@ struct Config {
     exes: Vec<PathBuf>,
     pdbs: Vec<PathBuf>,
 }
+
+struct ExeCache<'a> {
+    exe_path: PathBuf,
+    exe_bytes: Pin<Box<[u8]>>,
+
+    exe_capstone: capstone::Capstone,
+
+    pdb: pdb::PDB<'a, File>,
+    files: HashMap<String, HashMap<u32, pdb::LineInfo>>,
+}
+
+struct ExeCacheRefs<'a> {
+    exe_parsed: goblin::pe::PE<'a>,
+    exe_instructions: capstone::Instructions<'a>,
+}
+
+struct ExeCacheRefs2<'a> {
+    exe_instructions_sorted: HashMap<u64, &'a capstone::Insn<'a>>,
+}
+
+self_cell::self_cell!(
+    struct Cache<'a> {
+        owner: ExeCache<'a>,
+
+        #[covariant]
+        dependent: CacheRefs,
+    }
+);
+
+self_cell::self_cell!(
+    struct CacheRefs<'a> {
+        owner: ExeCacheRefs<'a>,
+
+        #[covariant]
+        dependent: ExeCacheRefs2,
+    }
+);
 
 fn main() {
     let rt = Runtime::new().unwrap();
@@ -52,20 +90,22 @@ fn main() {
         let mut config: Config = Default::default();
         // let mut cache: ExeCache;
         // let mut cache_refs : ExeCacheRefs;
-        let mut cache : Option<CachePair>;
+        let mut cache: Option<Cache> = None;
         for msg in &connection.receiver {
             match msg {
                 Message::Request(req) => {
                     if connection.handle_shutdown(&req).unwrap() {
                         return;
                     }
-                    handle_request(req, &connection, &config).await;
+                    if let Some(ref c) = cache {
+                        handle_request(req, &connection, c.borrow()).await;
+                    }
                 }
                 Message::Notification(notif) => match notif.method.as_str() {
                     "workspace/didChangeConfiguration" => {
                         if let Ok(c) = serde_json::from_value::<Config>(notif.params) {
                             config = c;
-                            cache = build_cache_pair(config.clone()).ok();
+                            cache = build_cache(config.clone()).ok();
                         }
                     }
                     _ => {}
@@ -79,250 +119,20 @@ fn main() {
     });
 }
 
-
-struct ExeCache<'a> {
-    exe_path: PathBuf,
-    exe_bytes: Pin<Box<[u8]>>,
-
-    exe_capstone: capstone::Capstone,
-
-    pdb: pdb::PDB<'a, File>,
-    files: HashMap<String, HashMap<u32, pdb::LineInfo>>,
-}
-
-struct ExeCacheRefs<'a> {
-    exe_parsed: goblin::pe::PE<'a>,
-    exe_instructions: capstone::Instructions<'a>,
-}
-
-struct ExeCacheRefs2<'a> {
-    exe_instructions_sorted: HashMap<u64, &'a capstone::Insn<'a>>,
-}
-
-self_cell::self_cell!(
-    struct CachePair<'a> {
-        owner: ExeCache<'a>,
-
-        #[covariant]
-        dependent: RefsPair,
-    }
-);
-
-self_cell::self_cell!(
-    struct RefsPair<'a> {
-        owner: ExeCacheRefs<'a>,
-
-        #[covariant]
-        dependent: ExeCacheRefs2,
-    }
-);
-
-fn build_cache_pair<'a>(config: Config) -> anyhow::Result<CachePair<'a>> {
+fn build_cache<'a>(config: Config) -> anyhow::Result<Cache<'a>> {
     let exe_path = config.exes[0].clone();
     let exe_bytes = std::fs::read(&exe_path)?;
     let cs = Capstone::new().x86().mode(arch::x86::ArchMode::Mode64).build()?;
-    let pdb_file = File::open(&config.pdbs[0])?; 
-    let pdb = PDB::open(pdb_file)?;
-
-    let x = CachePair::new(
-        ExeCache { 
-            exe_path, 
-            exe_bytes: Pin::new(exe_bytes.into_boxed_slice()),
-            exe_capstone: cs,
-            pdb,
-            files: Default::default()
-        }, 
-        |exe_cache| -> RefsPair {
-            let pe = PE::parse(&exe_cache.exe_bytes).unwrap();
-
-            let text_section = pe
-                .sections
-                .iter()
-                .find(|s| s.name().unwrap() == ".text")
-                .unwrap();
-            let bytes = &exe_cache.exe_bytes[text_section.pointer_to_raw_data as usize..text_section.size_of_raw_data as usize];
-            let exe_instructions = exe_cache.exe_capstone.disasm_all(bytes, text_section.virtual_address as u64).unwrap();
-            
-            RefsPair::new(
-                ExeCacheRefs {
-                    exe_parsed: pe,
-                    exe_instructions
-                },
-                |foo| {
-                    let mut exe_instructions_sorted : HashMap<u64, &capstone::Insn> = Default::default();
-                    for inst in foo.exe_instructions.iter() {
-                        exe_instructions_sorted.insert(inst.address(), inst);
-                    }
-
-                    ExeCacheRefs2 {
-                        exe_instructions_sorted
-                    }
-                }
-            )
-        });
-
-    Ok(x)
-}
-
-/*
-struct ExeCache<'a> {
-    exe_path: PathBuf,
-    exe_bytes: Pin<Box<[u8]>>,
-
-    exe_capstone: capstone::Capstone,
-
-    pdb: pdb::PDB<'a, File>,
-    files: HashMap<String, HashMap<u32, pdb::LineInfo>>,
-}
-
-struct ExeCacheRefs<'a> {
-    exe_parsed: goblin::pe::PE<'a>,
-    exe_instructions: capstone::Instructions<'a>,
-    exe_instructions_sorted: HashMap<u64, &'a capstone::Insn<'a>>,
-}
-
-impl<'a> ExeCache<'a> {
-    fn try_new(config: &Config) -> anyhow::Result<Self> {
-        let exe_path = config.exes[0].clone();
-        let exe_bytes = std::fs::read(&exe_path)?;
-
-        // Open PDB
-        let pdb_file = File::open(&config.pdbs[0])?;
-        let mut pdb = PDB::open(pdb_file)?;
-
-        // Extract PDB line info
-        let di = pdb.debug_information()?;
-        let string_table = pdb.string_table()?;
-        let mut modules = di.modules()?;
-
-        let mut file_name_lower: HashMap<pdb::RawString, String> = Default::default();
-        let mut files: HashMap<String, HashMap<u32, pdb::LineInfo>> = Default::default();
-        while let Some(module) = modules.next()? {
-            let info = pdb.module_info(&module)?.ok_or_else(|| anyhow!("Failed to get module info"))?;
-            let line_program = info.line_program()?;
-
-            let mut lines = line_program.lines();
-            while let Some(line) = lines.next()? {
-                let file_info = line_program.get_file_info(line.file_index)?;
-                let file_name = string_table.get(file_info.name)?;
-
-                // Try to ensure entry
-                if !file_name_lower.contains_key(&file_name) {
-                    if let Ok(pb) = PathBuf::from_str(&file_name.to_string()) {
-                        if let Some(lower) = pb.to_str().and_then(|s| Some(s.to_lowercase())) {
-                            file_name_lower.insert(file_name, lower);
-                        }
-                    }
-                }
-
-                if let Some(lower) = file_name_lower.get(&file_name) {
-                    if !files.contains_key(lower) {
-                        files.insert(lower.clone(), Default::default());
-                    }
-
-                    let files = files.get_mut(lower).unwrap();
-                    files.insert(line.line_start, line);
-                }
-            }
-        }
-
-        Ok(Self {
-            exe_path: config.exes[0].clone(),
-            exe_bytes: Pin::new(exe_bytes.into_boxed_slice()),
-            exe_capstone: Capstone::new().x86().mode(arch::x86::ArchMode::Mode64).build().unwrap(),
-            pdb,
-            files,
-        })
-    }
-}
-
-fn build_refs<'a>(cache: &'a ExeCache, cache_refs: &'a mut ExeCacheRefs<'a>) -> anyhow::Result<()> {
-    // Parse exe bytes
-    cache_refs.exe_parsed = PE::parse(&cache.exe_bytes)?;
-
-    // Get instructions
-    let text_section = cache_refs
-        .exe_parsed
-        .sections
-        .iter()
-        .find(|s| s.name().unwrap() == ".text")
-        .ok_or_else(|| anyhow!("Could not find text section"))?;
-    let bytes = &cache.exe_bytes[text_section.pointer_to_raw_data as usize..text_section.size_of_raw_data as usize];
-    cache_refs.exe_instructions = cache.exe_capstone.disasm_all(bytes, text_section.virtual_address as u64)?;
-
-    // Store map of address->instruction
-    for inst in cache_refs.exe_instructions.iter() {
-        cache_refs.exe_instructions_sorted.insert(inst.address(), inst);
-    }
-
-    Ok(())
-}
-*/
-
-/*
-struct Cache<'a> {
-    exe_cache: ExeCache<'a>,
-}
-
-struct ExeCache<'a> {
-    exe_path: PathBuf,
-    exe_bytes: Pin<Box<[u8]>>,
-
-    exe_parsed: goblin::pe::PE<'a>,
-    exe_capstone: capstone::Capstone,
-
-    pdb: pdb::PDB<'a, File>,
-    files: HashMap<String, HashMap<u32, pdb::LineInfo>>,
-
-    exe_instructions: capstone::Instructions<'static>,
-    exe_instructions_sorted: HashMap<u64, &'static capstone::Insn<'static>>,
-}
-
-fn _cache_config(config: &Config, cache: &mut Cache) -> anyhow::Result<()> {
-    cache.exe_cache.exe_path = config.exes[0].clone();
-    let exe_bytes = std::fs::read(&cache.exe_cache.exe_path)?;
-    cache.exe_cache.exe_bytes = Pin::new(exe_bytes.into_boxed_slice());
-
-    // Parse EXE
-    // unsafe: rust is stupid
-    unsafe {
-        let ptr = cache.exe_cache.exe_bytes.as_ptr();
-        let len = cache.exe_cache.exe_bytes.len();
-        let slice = std::slice::from_raw_parts(ptr, len);
-        cache.exe_cache.exe_parsed = PE::parse(slice)?;
-    }
-
-    cache.exe_cache.exe_capstone = Capstone::new().x86().mode(arch::x86::ArchMode::Mode64).build()?;
-    let text_section = cache
-        .exe_cache
-        .exe_parsed
-        .sections
-        .iter()
-        .find(|s| s.name().unwrap() == ".text")
-        .ok_or_else(|| anyhow!("Could not find text section"))?;
-    let bytes = &cache.exe_cache.exe_bytes[text_section.pointer_to_raw_data as usize..text_section.size_of_raw_data as usize];
-    let x = cache.exe_cache.exe_capstone.disasm_all(bytes, text_section.virtual_address as u64)?;
-    unsafe {
-        let y = std::slice::from_raw_parts(x.as_ptr(), x.len());
-        cache.exe_cache.exe_instructions = std::mem::transmute(y);
-    }
-
-    for inst in cache.exe_cache.exe_instructions.iter() {
-        unsafe {
-            cache.exe_cache.exe_instructions_sorted.insert(inst.address(), std::mem::transmute(inst));
-        }
-    }
-
-    // Parse and cache PDB
     let pdb_file = File::open(&config.pdbs[0])?;
-    cache.exe_cache.pdb = PDB::open(pdb_file)?;
+    let mut pdb = PDB::open(pdb_file)?;
 
-    let pdb = &mut cache.exe_cache.pdb;
+    // Pre-process PDB
     let di = pdb.debug_information()?;
     let string_table = pdb.string_table()?;
     let mut modules = di.modules()?;
 
     let mut file_name_lower: HashMap<pdb::RawString, String> = Default::default();
+    let mut files: HashMap<String, HashMap<u32, pdb::LineInfo>> = Default::default();
     while let Some(module) = modules.next()? {
         let info = pdb.module_info(&module)?.unwrap();
         let line_program = info.line_program()?;
@@ -342,55 +152,81 @@ fn _cache_config(config: &Config, cache: &mut Cache) -> anyhow::Result<()> {
             }
 
             if let Some(lower) = file_name_lower.get(&file_name) {
-                if !cache.exe_cache.files.contains_key(lower) {
-                    cache.exe_cache.files.insert(lower.clone(), Default::default());
+                if !files.contains_key(lower) {
+                    files.insert(lower.clone(), Default::default());
                 }
 
-                let files = cache.exe_cache.files.get_mut(lower).unwrap();
-                files.insert(line.line_start, line);
+                files.get_mut(lower).unwrap().insert(line.line_start, line);
             }
         }
     }
 
-    Ok(())
-}
-*/
+    let x = Cache::new(
+        ExeCache {
+            exe_path,
+            exe_bytes: Pin::new(exe_bytes.into_boxed_slice()),
+            exe_capstone: cs,
+            pdb,
+            files,
+        },
+        |exe_cache| -> CacheRefs {
+            let pe = PE::parse(&exe_cache.exe_bytes).unwrap();
 
-async fn handle_request(req: Request, connection: &Connection, config: &Config) {
+            let text_section = pe.sections.iter().find(|s| s.name().unwrap() == ".text").unwrap();
+            let bytes = &exe_cache.exe_bytes[text_section.pointer_to_raw_data as usize..text_section.size_of_raw_data as usize];
+            let exe_instructions = exe_cache.exe_capstone.disasm_all(bytes, text_section.virtual_address as u64).unwrap();
+
+            CacheRefs::new(
+                ExeCacheRefs {
+                    exe_parsed: pe,
+                    exe_instructions,
+                },
+                |refs| {
+                    let mut exe_instructions_sorted: HashMap<u64, &capstone::Insn> = Default::default();
+                    for inst in refs.exe_instructions.iter() {
+                        exe_instructions_sorted.insert(inst.address(), inst);
+                    }
+
+                    ExeCacheRefs2 { exe_instructions_sorted }
+                },
+            )
+        },
+    );
+
+    Ok(x)
+}
+
+async fn handle_request<'a>(req: Request, connection: &Connection, cache: &Cache<'a>) {
     if let Ok((id, params)) = req.extract::<GotoDefinitionParams>("textDocument/definition") {
-        let response = goto_definition(params, config).await;
+        let response = goto_definition(params, cache).await;
         let resp = Response::new_ok(id, response.ok());
         connection.sender.send(Message::Response(resp)).unwrap();
     }
 }
 
-async fn goto_definition(params: GotoDefinitionParams, config: &Config) -> anyhow::Result<GotoDefinitionResponse> {
+async fn goto_definition<'a>(params: GotoDefinitionParams, cache: &Cache<'a>) -> anyhow::Result<GotoDefinitionResponse> {
     let mut debug_log = std::fs::OpenOptions::new().create(true).append(true).open("c:/temp/hack_log.txt")?;
-
-    if config.exes.len() == 0 || config.pdbs.len() == 0 {
-        anyhow::bail!("Empty config");
-    }
-    let exe_path = &config.exes[0];
-    let pdb_path = &config.pdbs[0];
 
     let uri = params.text_document_position_params.text_document.uri;
     let filepath = uri.to_file_path().ok().ok_or_else(|| anyhow!("Couldn't get filepath from [{:?}]", uri))?;
-    let source_file = filepath.normalize()?;
+    let source_file = filepath.normalize()?.as_path().to_string_lossy().to_lowercase();
     let line_number = params.text_document_position_params.position.line + 1;
 
     debug_log.write_all("Target File: ".as_bytes())?;
-    debug_log.write_all(source_file.as_path().to_string_lossy().as_bytes())?;
+    debug_log.write_all(source_file.as_bytes())?;
     debug_log.write_all("\n".as_bytes())?;
 
-    // Open the EXE file and parse it using goblin
-    let exe_data = std::fs::read(exe_path)?;
-    let pe = PE::parse(&exe_data)?;
-
-    // Open the PDB file
-    let pdb_file = File::open(pdb_path)?;
-    let mut pdb = PDB::open(pdb_file)?;
-    let di = pdb.debug_information()?;
-    let string_table = pdb.string_table()?;
+    let pdb = &cache.borrow_owner().pdb;
+    let address_map = pdb.address_map()?;
+    let address_range = if let Some(line) = cache.borrow_owner().files.get(&source_file).and_then(|lines| lines.get(&line_number)) {
+        let rva = line
+            .offset
+            .to_rva(&address_map)
+            .ok_or_else(|| anyhow!("Could not map line offset to RVA"))?;
+        (rva.0, rva.0 + line.length.unwrap_or_default())
+    } else {
+        anyhow::bail!("Could not fine entry for [{source_file}]:[{line_number}]");
+    };
 
     // Get the address map from the PDB
     let address_map = pdb.address_map()?;

@@ -1,15 +1,16 @@
 use anyhow::anyhow;
 use capstone::prelude::*;
 use goblin::pe::PE;
+use itertools::Itertools;
 use lsp_server::{Connection, Message, Request, Response};
 use lsp_types::{GotoDefinitionParams, GotoDefinitionResponse, InitializeResult, Position, ServerCapabilities};
 use normpath::PathExt;
 use pdb::{FallibleIterator, PDB};
-use std::borrow::Borrow;
+use std::borrow::{Borrow, BorrowMut};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::str::FromStr;
 use symbolic::common::{ByteView, DSymPathExt};
@@ -31,11 +32,15 @@ struct ExeCache<'a> {
 
     pdb: pdb::PDB<'a, File>,
     files: HashMap<String, HashMap<u32, pdb::LineInfo>>,
+
+    symcache_bytes: Pin<Box<[u8]>>,
 }
 
 struct ExeCacheRefs<'a> {
     exe_parsed: goblin::pe::PE<'a>,
     exe_instructions: capstone::Instructions<'a>,
+    address_map: pdb::AddressMap<'a>,
+    symcache: SymCache<'a>,
 }
 
 struct ExeCacheRefs2<'a> {
@@ -87,9 +92,6 @@ fn main() {
         connection.initialize_finish(initialize_id, initialize_result_value).unwrap();
 
         // Main message loop
-        let mut config: Config = Default::default();
-        // let mut cache: ExeCache;
-        // let mut cache_refs : ExeCacheRefs;
         let mut cache: Option<Cache> = None;
         for msg in &connection.receiver {
             match msg {
@@ -103,9 +105,8 @@ fn main() {
                 }
                 Message::Notification(notif) => match notif.method.as_str() {
                     "workspace/didChangeConfiguration" => {
-                        if let Ok(c) = serde_json::from_value::<Config>(notif.params) {
-                            config = c;
-                            cache = build_cache(config.clone()).ok();
+                        if let Ok(config) = serde_json::from_value::<Config>(notif.params) {
+                            cache = build_cache(config).ok();
                         }
                     }
                     _ => {}
@@ -121,10 +122,12 @@ fn main() {
 
 fn build_cache<'a>(config: Config) -> anyhow::Result<Cache<'a>> {
     let exe_path = config.exes[0].clone();
+    let pdb_path = &config.pdbs[0];
     let exe_bytes = std::fs::read(&exe_path)?;
     let cs = Capstone::new().x86().mode(arch::x86::ArchMode::Mode64).build()?;
-    let pdb_file = File::open(&config.pdbs[0])?;
+    let pdb_file = File::open(&pdb_path)?;
     let mut pdb = PDB::open(pdb_file)?;
+    let address_map = pdb.address_map()?;
 
     // Pre-process PDB
     let di = pdb.debug_information()?;
@@ -161,13 +164,33 @@ fn build_cache<'a>(config: Config) -> anyhow::Result<Cache<'a>> {
         }
     }
 
-    let x = Cache::new(
+    // Create SymCache
+    let dsym_path = pdb_path.resolve_dsym();
+    let byteview = ByteView::open(dsym_path.as_deref().unwrap_or_else(|| pdb_path.as_ref()))?;
+
+    let fat_obj = Archive::parse(&byteview)?;
+    let objects_result: Result<Vec<_>, _> = fat_obj.objects().collect();
+    let objects = objects_result?;
+    if objects.len() != 1 {
+        anyhow::bail!("Error initializing symcache. Expected 1 object found {}", objects.len());
+    }
+    let obj = &objects[0];
+
+    let mut converter = SymCacheConverter::new();
+    converter.process_object(obj)?;
+
+    let mut symcache_bytes = Vec::new();
+    converter.serialize(&mut std::io::Cursor::new(&mut symcache_bytes))?;
+
+    // Construct Cache
+    Ok(Cache::new(
         ExeCache {
             exe_path,
             exe_bytes: Pin::new(exe_bytes.into_boxed_slice()),
             exe_capstone: cs,
             pdb,
             files,
+            symcache_bytes: Pin::new(symcache_bytes.into_boxed_slice()),
         },
         |exe_cache| -> CacheRefs {
             let pe = PE::parse(&exe_cache.exe_bytes).unwrap();
@@ -180,8 +203,10 @@ fn build_cache<'a>(config: Config) -> anyhow::Result<Cache<'a>> {
                 ExeCacheRefs {
                     exe_parsed: pe,
                     exe_instructions,
+                    address_map,
+                    symcache: SymCache::parse(&exe_cache.symcache_bytes).unwrap(),
                 },
-                |refs| {
+                move |refs| {
                     let mut exe_instructions_sorted: HashMap<u64, &capstone::Insn> = Default::default();
                     for inst in refs.exe_instructions.iter() {
                         exe_instructions_sorted.insert(inst.address(), inst);
@@ -191,9 +216,7 @@ fn build_cache<'a>(config: Config) -> anyhow::Result<Cache<'a>> {
                 },
             )
         },
-    );
-
-    Ok(x)
+    ))
 }
 
 async fn handle_request<'a>(req: Request, connection: &Connection, cache: &Cache<'a>) {
@@ -207,6 +230,7 @@ async fn handle_request<'a>(req: Request, connection: &Connection, cache: &Cache
 async fn goto_definition<'a>(params: GotoDefinitionParams, cache: &Cache<'a>) -> anyhow::Result<GotoDefinitionResponse> {
     let mut debug_log = std::fs::OpenOptions::new().create(true).append(true).open("c:/temp/hack_log.txt")?;
 
+    // Input data
     let uri = params.text_document_position_params.text_document.uri;
     let filepath = uri.to_file_path().ok().ok_or_else(|| anyhow!("Couldn't get filepath from [{:?}]", uri))?;
     let source_file = filepath.normalize()?.as_path().to_string_lossy().to_lowercase();
@@ -216,190 +240,92 @@ async fn goto_definition<'a>(params: GotoDefinitionParams, cache: &Cache<'a>) ->
     debug_log.write_all(source_file.as_bytes())?;
     debug_log.write_all("\n".as_bytes())?;
 
-    let pdb = &cache.borrow_owner().pdb;
-    let address_map = pdb.address_map()?;
-    let address_range = if let Some(line) = cache.borrow_owner().files.get(&source_file).and_then(|lines| lines.get(&line_number)) {
+    // Find exe address range for (source_file, line_info)
+    let (start, end) = if let Some(line) = cache.borrow_owner().files.get(&source_file).and_then(|lines| lines.get(&line_number)) {
         let rva = line
             .offset
-            .to_rva(&address_map)
+            .to_rva(&cache.borrow_dependent().borrow_owner().address_map)
             .ok_or_else(|| anyhow!("Could not map line offset to RVA"))?;
         (rva.0, rva.0 + line.length.unwrap_or_default())
     } else {
         anyhow::bail!("Could not fine entry for [{source_file}]:[{line_number}]");
     };
 
-    // Get the address map from the PDB
-    let address_map = pdb.address_map()?;
-
-    // Iterate over all modules and their line information
-    let mut modules = di.modules()?;
-    let mut address_ranges: Vec<(u32, u32)> = Vec::new();
-
-    while let Some(module) = modules.next()? {
-        let info = pdb.module_info(&module)?.unwrap();
-        let line_program = info.line_program()?;
-
-        let mut lines = line_program.lines();
-        while let Some(line) = lines.next()? {
-            if line.line_start != line_number {
-                continue;
-            }
-
-            let file_info = line_program.get_file_info(line.file_index)?;
-            let file_name = string_table.get(file_info.name)?;
-
-            if let Ok(file_path) = PathBuf::from_str(&file_name.to_string())?.normalize() {
-                debug_log.write_all(file_path.as_path().to_string_lossy().as_bytes())?;
-                debug_log.write_all("\n".as_bytes())?;
-
-                if are_paths_equal_case_insensitive(file_path.as_path(), source_file.as_path()) {
-                    let rva = line.offset.to_rva(&address_map).unwrap();
-                    address_ranges.push((rva.0, rva.0 + line.length.unwrap()));
-                }
-            }
-        }
-    }
-
-    if address_ranges.is_empty() {
-        anyhow::bail!("No address ranges found for the specified file and line number.");
-    }
-
-    // Disassemble the address ranges (capstone)
-    let cs = Capstone::new().x86().mode(arch::x86::ArchMode::Mode64).build()?;
-    let text_section = pe
+    // Find calls made within line
+    let mut source_locations: Vec<(String, u32)> = Default::default();
+    let pe = &cache.borrow_dependent().borrow_owner().exe_parsed;
+    let section = pe
         .sections
         .iter()
-        .find(|s| s.name().unwrap() == ".text")
-        .ok_or_else(|| anyhow!("Could not find text section"))?;
-    let bytes = &exe_data[text_section.pointer_to_raw_data as usize..text_section.size_of_raw_data as usize];
-    let all_exe_instructions = cs.disasm_all(bytes, text_section.virtual_address as u64)?;
-    let exe_instruction_map: HashMap<u64, _> = all_exe_instructions.iter().map(|inst| (inst.address(), inst)).collect();
+        .find(|sec| sec.virtual_address <= start && start < sec.virtual_address + sec.virtual_size);
+    if let Some(section) = section {
+        let offset = (start - section.virtual_address) as usize;
+        let size = (end - start) as usize;
+        let bytes =
+            &cache.borrow_owner().exe_bytes[section.pointer_to_raw_data as usize + offset..section.pointer_to_raw_data as usize + offset + size];
+        let instructions = cache.borrow_owner().exe_capstone.disasm_all(bytes, start as u64)?;
 
-    let mut result: Vec<(String, u32)> = Default::default();
+        for instruction in instructions.iter() {
+            //println!("{}", instruction);
+            if instruction.mnemonic().unwrap_or_default() == "call" {
+                // looks like op_code performs the relative address computation for us
+                // maybe_target_address == target_address
+                let offset_bytes = &instruction.bytes()[1..5];
+                let offset = i32::from_le_bytes([offset_bytes[0], offset_bytes[1], offset_bytes[2], offset_bytes[3]]);
+                let _maybe_target_address = (instruction.address() as i64 + instruction.len() as i64) + (offset as i64);
 
-    for (start, end) in address_ranges.clone() {
-        let section = pe
-            .sections
-            .iter()
-            .find(|sec| sec.virtual_address <= start && start < sec.virtual_address + sec.virtual_size);
-        if let Some(section) = section {
-            let offset = (start - section.virtual_address) as usize;
-            let size = (end - start) as usize;
-            let bytes = &exe_data[section.pointer_to_raw_data as usize + offset..section.pointer_to_raw_data as usize + offset + size];
-            let instructions = cs.disasm_all(bytes, start as u64)?;
+                let op_str = instruction.op_str().unwrap();
+                let mut target_address = u64::from_str_radix(op_str.trim_start_matches("0x"), 16).unwrap();
 
-            for instruction in instructions.iter() {
-                //println!("{}", instruction);
-                if instruction.mnemonic().unwrap_or_default() == "call" {
-                    // looks like op_code performs the relative address computation for us
-                    // maybe_target_address == target_address
-                    let offset_bytes = &instruction.bytes()[1..5];
-                    let offset = i32::from_le_bytes([offset_bytes[0], offset_bytes[1], offset_bytes[2], offset_bytes[3]]);
-                    let _maybe_target_address = (instruction.address() as i64 + instruction.len() as i64) + (offset as i64);
-
-                    let op_str = instruction.op_str().unwrap();
-                    let mut target_address = u64::from_str_radix(op_str.trim_start_matches("0x"), 16).unwrap();
-
-                    // lookup target instruction, may be jmp
-                    let maybe_inst = exe_instruction_map.get(&target_address);
-                    if let Some(instruction) = maybe_inst {
-                        if instruction.mnemonic().unwrap_or_default() == "jmp" {
-                            let op_str = instruction.op_str().unwrap();
-                            let new_target_address = u64::from_str_radix(op_str.trim_start_matches("0x"), 16).unwrap();
-                            //println!("    Remapping call 0x{:x} to 0x{:x}", target_address, new_target_address);
-                            target_address = new_target_address;
-                        }
-                    }
-
-                    let r = map_address_to_file_and_line(&pdb_path, target_address);
-                    match r {
-                        Ok((file, line)) => {
-                            //println!("    Function Address: 0x{:x}", target_address);
-                            //println!("      File: [{file}]");
-                            //println!("      Line: [{line}]");
-                            result.push((file, line));
-                        }
-                        Err(e) => {
-                            //println!("    );
-                            anyhow::bail!("No mapping found for address 0x{:x}. Error: {}", target_address, e);
-                        }
+                // lookup target instruction, may be jmp
+                let maybe_inst = cache.borrow_dependent().borrow_dependent().exe_instructions_sorted.get(&target_address);
+                if let Some(instruction) = maybe_inst {
+                    if instruction.mnemonic().unwrap_or_default() == "jmp" {
+                        let op_str = instruction.op_str().unwrap();
+                        let new_target_address = u64::from_str_radix(op_str.trim_start_matches("0x"), 16).unwrap();
+                        //println!("    Remapping call 0x{:x} to 0x{:x}", target_address, new_target_address);
+                        target_address = new_target_address;
                     }
                 }
+
+                let symcache = &cache.borrow_dependent().borrow_owner().symcache;
+                let m = symcache.lookup(target_address).collect::<Vec<_>>();
+                if m.len() == 0 {
+                    anyhow::bail!("Could not find function at address [0x{:x}]", target_address);
+                }
+
+                let source_loc = &m[0];
+                let path = source_loc.file().map(|file| file.full_path()).unwrap_or_else(|| "<unknown file>".into());
+                let line = source_loc.line();
+                source_locations.push((path, line));
             }
         }
     }
 
-    if result.len() == 0 {
+    source_locations = source_locations.into_iter().unique().collect();
+
+    if source_locations.len() == 0 {
         anyhow::bail!("Failed to map file/line to anything");
     }
-    if result.len() == 1 {
-        let file = &result[0].0;
-        let pos = Position::new(result[0].1 - 1, 0); // lines start at 0?
-        let uri = url::Url::from_file_path(&file)
-            .ok()
-            .ok_or_else(|| anyhow!("Could not create URL from [{:?}]", file))?;
 
-        let location = lsp_types::Location {
-            uri: uri,
-            range: lsp_types::Range { start: pos, end: pos },
-        };
+    let lsp_locations: Vec<_> = source_locations
+        .iter()
+        .filter_map(|sl| {
+            let file = &sl.0;
+            let line = sl.1;
+            let pos = Position::new(line - 1, 0); // lines start at 0?
+            url::Url::from_file_path(&file).ok().and_then(|uri| {
+                Some(lsp_types::Location {
+                    uri: uri,
+                    range: lsp_types::Range { start: pos, end: pos },
+                })
+            })
+        })
+        .collect();
 
-        return Ok(GotoDefinitionResponse::Scalar(location));
+    if lsp_locations.len() == 1 {
+        return Ok(GotoDefinitionResponse::Scalar(lsp_locations[0].clone()));
     } else {
-        let mut locations: Vec<lsp_types::Location> = Default::default();
-        for entry in &result {
-            let file = &entry.0;
-            let pos = Position::new(entry.1 - 1, 0);
-            let uri = url::Url::from_file_path(&file)
-                .ok()
-                .ok_or_else(|| anyhow!("Could not create URL from [{:?}]", file))?;
-
-            let location = lsp_types::Location {
-                uri: uri,
-                range: lsp_types::Range { start: pos, end: pos },
-            };
-
-            locations.push(location);
-        }
-
-        return Ok(GotoDefinitionResponse::Array(locations));
+        return Ok(GotoDefinitionResponse::Array(lsp_locations));
     }
-}
-
-fn map_address_to_file_and_line(path: &Path, address: u64) -> anyhow::Result<(String, u32)> {
-    let pb: PathBuf = path.into();
-    let dsym_path = pb.resolve_dsym();
-    let byteview = ByteView::open(dsym_path.as_deref().unwrap_or_else(|| pb.as_ref()))?;
-
-    let fat_obj = Archive::parse(&byteview)?;
-    let objects_result: Result<Vec<_>, _> = fat_obj.objects().collect();
-    let objects = objects_result?;
-    assert!(objects.len() == 1);
-    let obj = &objects[0];
-
-    let mut converter = SymCacheConverter::new();
-    converter.process_object(obj)?;
-
-    let mut result = Vec::new();
-    converter.serialize(&mut std::io::Cursor::new(&mut result))?;
-    let buffer = ByteView::from_vec(result);
-    let symcache = SymCache::parse(&buffer)?;
-
-    let m = symcache.lookup(address).collect::<Vec<_>>();
-    if m.len() == 0 {
-        anyhow::bail!("Could not find function at address [0x{:x}]", address);
-    }
-    assert!(m.len() == 1); // what does multiple answers mean?
-
-    let sym = &m[0];
-    let path = sym.file().map(|file| file.full_path()).unwrap_or_else(|| "<unknown file>".into());
-    let line = sym.line();
-    Ok((path, line))
-}
-
-fn are_paths_equal_case_insensitive(path1: &Path, path2: &Path) -> bool {
-    path1
-        .to_str()
-        .and_then(|s| path2.to_str().map(|t| s.to_lowercase() == t.to_lowercase()))
-        .unwrap_or(false)
 }

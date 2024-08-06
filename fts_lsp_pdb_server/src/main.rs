@@ -6,7 +6,6 @@ use lsp_server::{Connection, Message, Request, Response};
 use lsp_types::{GotoDefinitionParams, GotoDefinitionResponse, InitializeResult, Position, ServerCapabilities};
 use normpath::PathExt;
 use pdb::{FallibleIterator, PDB};
-use std::borrow::{Borrow, BorrowMut};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
@@ -24,13 +23,14 @@ struct Config {
     pdbs: Vec<PathBuf>,
 }
 
-struct ExeCache<'a> {
-    exe_path: PathBuf,
+struct ExeCache {
+    //exe_path: PathBuf,
     exe_bytes: Pin<Box<[u8]>>,
 
     exe_capstone: capstone::Capstone,
 
-    pdb: pdb::PDB<'a, File>,
+    pdb_path: PathBuf,
+    //pdb: pdb::PDB<'a, File>,
     files: HashMap<String, HashMap<u32, pdb::LineInfo>>,
 
     symcache_bytes: Pin<Box<[u8]>>,
@@ -39,7 +39,6 @@ struct ExeCache<'a> {
 struct ExeCacheRefs<'a> {
     exe_parsed: goblin::pe::PE<'a>,
     exe_instructions: capstone::Instructions<'a>,
-    address_map: pdb::AddressMap<'a>,
     symcache: SymCache<'a>,
 }
 
@@ -48,8 +47,8 @@ struct ExeCacheRefs2<'a> {
 }
 
 self_cell::self_cell!(
-    struct Cache<'a> {
-        owner: ExeCache<'a>,
+    struct Cache {
+        owner: ExeCache,
 
         #[covariant]
         dependent: CacheRefs,
@@ -100,7 +99,7 @@ fn main() {
                         return;
                     }
                     if let Some(ref c) = cache {
-                        handle_request(req, &connection, c.borrow()).await;
+                        handle_request(req, &connection, c).await;
                     }
                 }
                 Message::Notification(notif) => match notif.method.as_str() {
@@ -120,14 +119,13 @@ fn main() {
     });
 }
 
-fn build_cache<'a>(config: Config) -> anyhow::Result<Cache<'a>> {
+fn build_cache(config: Config) -> anyhow::Result<Cache> {
     let exe_path = config.exes[0].clone();
-    let pdb_path = &config.pdbs[0];
+    let pdb_path = config.pdbs[0].clone();
     let exe_bytes = std::fs::read(&exe_path)?;
     let cs = Capstone::new().x86().mode(arch::x86::ArchMode::Mode64).build()?;
     let pdb_file = File::open(&pdb_path)?;
     let mut pdb = PDB::open(pdb_file)?;
-    let address_map = pdb.address_map()?;
 
     // Pre-process PDB
     let di = pdb.debug_information()?;
@@ -185,10 +183,11 @@ fn build_cache<'a>(config: Config) -> anyhow::Result<Cache<'a>> {
     // Construct Cache
     Ok(Cache::new(
         ExeCache {
-            exe_path,
+            //exe_path,
             exe_bytes: Pin::new(exe_bytes.into_boxed_slice()),
             exe_capstone: cs,
-            pdb,
+            pdb_path,
+            //pdb,
             files,
             symcache_bytes: Pin::new(symcache_bytes.into_boxed_slice()),
         },
@@ -203,7 +202,6 @@ fn build_cache<'a>(config: Config) -> anyhow::Result<Cache<'a>> {
                 ExeCacheRefs {
                     exe_parsed: pe,
                     exe_instructions,
-                    address_map,
                     symcache: SymCache::parse(&exe_cache.symcache_bytes).unwrap(),
                 },
                 move |refs| {
@@ -219,7 +217,7 @@ fn build_cache<'a>(config: Config) -> anyhow::Result<Cache<'a>> {
     ))
 }
 
-async fn handle_request<'a>(req: Request, connection: &Connection, cache: &Cache<'a>) {
+async fn handle_request(req: Request, connection: &Connection, cache: &Cache) {
     if let Ok((id, params)) = req.extract::<GotoDefinitionParams>("textDocument/definition") {
         let response = goto_definition(params, cache).await;
         let resp = Response::new_ok(id, response.ok());
@@ -227,7 +225,7 @@ async fn handle_request<'a>(req: Request, connection: &Connection, cache: &Cache
     }
 }
 
-async fn goto_definition<'a>(params: GotoDefinitionParams, cache: &Cache<'a>) -> anyhow::Result<GotoDefinitionResponse> {
+async fn goto_definition(params: GotoDefinitionParams, cache: &Cache) -> anyhow::Result<GotoDefinitionResponse> {
     let mut debug_log = std::fs::OpenOptions::new().create(true).append(true).open("c:/temp/hack_log.txt")?;
 
     // Input data
@@ -240,11 +238,16 @@ async fn goto_definition<'a>(params: GotoDefinitionParams, cache: &Cache<'a>) ->
     debug_log.write_all(source_file.as_bytes())?;
     debug_log.write_all("\n".as_bytes())?;
 
+    // Reparse PDB because Rust is stupid
+    let pdb_file = File::open(&cache.borrow_owner().pdb_path)?;
+    let mut pdb = PDB::open(pdb_file)?;
+    let address_map = pdb.address_map()?;
+
     // Find exe address range for (source_file, line_info)
     let (start, end) = if let Some(line) = cache.borrow_owner().files.get(&source_file).and_then(|lines| lines.get(&line_number)) {
         let rva = line
             .offset
-            .to_rva(&cache.borrow_dependent().borrow_owner().address_map)
+            .to_rva(&address_map)
             .ok_or_else(|| anyhow!("Could not map line offset to RVA"))?;
         (rva.0, rva.0 + line.length.unwrap_or_default())
     } else {

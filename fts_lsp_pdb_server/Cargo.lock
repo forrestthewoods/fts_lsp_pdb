@@ -284,6 +284,7 @@ dependencies = [
  "lsp-types",
  "normpath",
  "pdb",
+ "self_cell",
  "serde",
  "serde_json",
  "symbolic",
@@ -763,6 +764,12 @@ dependencies = [
  "quote",
  "syn",
 ]
+
+[[package]]
+name = "self_cell"
+version = "1.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d369a96f978623eb3dc28807c4852d6cc617fed53da5d3c400feff1ef34a714a"
 
 [[package]]
 name = "semver"

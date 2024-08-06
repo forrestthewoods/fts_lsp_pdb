@@ -9,13 +9,14 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::str::FromStr;
 use symbolic::common::{ByteView, DSymPathExt};
 use symbolic::debuginfo::Archive;
 use symbolic::symcache::{SymCache, SymCacheConverter};
 use tokio::runtime::Runtime;
 
-#[derive(Default, serde::Deserialize)]
+#[derive(Clone, Default, serde::Deserialize)]
 struct Config {
     exes: Vec<PathBuf>,
     pdbs: Vec<PathBuf>,
@@ -49,6 +50,9 @@ fn main() {
 
         // Main message loop
         let mut config: Config = Default::default();
+        // let mut cache: ExeCache;
+        // let mut cache_refs : ExeCacheRefs;
+        let mut cache : Option<CachePair>;
         for msg in &connection.receiver {
             match msg {
                 Message::Request(req) => {
@@ -61,6 +65,7 @@ fn main() {
                     "workspace/didChangeConfiguration" => {
                         if let Ok(c) = serde_json::from_value::<Config>(notif.params) {
                             config = c;
+                            cache = build_cache_pair(config.clone()).ok();
                         }
                     }
                     _ => {}
@@ -74,27 +79,209 @@ fn main() {
     });
 }
 
+
+struct ExeCache<'a> {
+    exe_path: PathBuf,
+    exe_bytes: Pin<Box<[u8]>>,
+
+    exe_capstone: capstone::Capstone,
+
+    pdb: pdb::PDB<'a, File>,
+    files: HashMap<String, HashMap<u32, pdb::LineInfo>>,
+}
+
+struct ExeCacheRefs<'a> {
+    exe_parsed: goblin::pe::PE<'a>,
+    exe_instructions: capstone::Instructions<'a>,
+}
+
+struct ExeCacheRefs2<'a> {
+    exe_instructions_sorted: HashMap<u64, &'a capstone::Insn<'a>>,
+}
+
+self_cell::self_cell!(
+    struct CachePair<'a> {
+        owner: ExeCache<'a>,
+
+        #[covariant]
+        dependent: RefsPair,
+    }
+);
+
+self_cell::self_cell!(
+    struct RefsPair<'a> {
+        owner: ExeCacheRefs<'a>,
+
+        #[covariant]
+        dependent: ExeCacheRefs2,
+    }
+);
+
+fn build_cache_pair<'a>(config: Config) -> anyhow::Result<CachePair<'a>> {
+    let exe_path = config.exes[0].clone();
+    let exe_bytes = std::fs::read(&exe_path)?;
+    let cs = Capstone::new().x86().mode(arch::x86::ArchMode::Mode64).build()?;
+    let pdb_file = File::open(&config.pdbs[0])?; 
+    let pdb = PDB::open(pdb_file)?;
+
+    let x = CachePair::new(
+        ExeCache { 
+            exe_path, 
+            exe_bytes: Pin::new(exe_bytes.into_boxed_slice()),
+            exe_capstone: cs,
+            pdb,
+            files: Default::default()
+        }, 
+        |exe_cache| -> RefsPair {
+            let pe = PE::parse(&exe_cache.exe_bytes).unwrap();
+
+            let text_section = pe
+                .sections
+                .iter()
+                .find(|s| s.name().unwrap() == ".text")
+                .unwrap();
+            let bytes = &exe_cache.exe_bytes[text_section.pointer_to_raw_data as usize..text_section.size_of_raw_data as usize];
+            let exe_instructions = exe_cache.exe_capstone.disasm_all(bytes, text_section.virtual_address as u64).unwrap();
+            
+            RefsPair::new(
+                ExeCacheRefs {
+                    exe_parsed: pe,
+                    exe_instructions
+                },
+                |foo| {
+                    let mut exe_instructions_sorted : HashMap<u64, &capstone::Insn> = Default::default();
+                    for inst in foo.exe_instructions.iter() {
+                        exe_instructions_sorted.insert(inst.address(), inst);
+                    }
+
+                    ExeCacheRefs2 {
+                        exe_instructions_sorted
+                    }
+                }
+            )
+        });
+
+    Ok(x)
+}
+
+/*
+struct ExeCache<'a> {
+    exe_path: PathBuf,
+    exe_bytes: Pin<Box<[u8]>>,
+
+    exe_capstone: capstone::Capstone,
+
+    pdb: pdb::PDB<'a, File>,
+    files: HashMap<String, HashMap<u32, pdb::LineInfo>>,
+}
+
+struct ExeCacheRefs<'a> {
+    exe_parsed: goblin::pe::PE<'a>,
+    exe_instructions: capstone::Instructions<'a>,
+    exe_instructions_sorted: HashMap<u64, &'a capstone::Insn<'a>>,
+}
+
+impl<'a> ExeCache<'a> {
+    fn try_new(config: &Config) -> anyhow::Result<Self> {
+        let exe_path = config.exes[0].clone();
+        let exe_bytes = std::fs::read(&exe_path)?;
+
+        // Open PDB
+        let pdb_file = File::open(&config.pdbs[0])?;
+        let mut pdb = PDB::open(pdb_file)?;
+
+        // Extract PDB line info
+        let di = pdb.debug_information()?;
+        let string_table = pdb.string_table()?;
+        let mut modules = di.modules()?;
+
+        let mut file_name_lower: HashMap<pdb::RawString, String> = Default::default();
+        let mut files: HashMap<String, HashMap<u32, pdb::LineInfo>> = Default::default();
+        while let Some(module) = modules.next()? {
+            let info = pdb.module_info(&module)?.ok_or_else(|| anyhow!("Failed to get module info"))?;
+            let line_program = info.line_program()?;
+
+            let mut lines = line_program.lines();
+            while let Some(line) = lines.next()? {
+                let file_info = line_program.get_file_info(line.file_index)?;
+                let file_name = string_table.get(file_info.name)?;
+
+                // Try to ensure entry
+                if !file_name_lower.contains_key(&file_name) {
+                    if let Ok(pb) = PathBuf::from_str(&file_name.to_string()) {
+                        if let Some(lower) = pb.to_str().and_then(|s| Some(s.to_lowercase())) {
+                            file_name_lower.insert(file_name, lower);
+                        }
+                    }
+                }
+
+                if let Some(lower) = file_name_lower.get(&file_name) {
+                    if !files.contains_key(lower) {
+                        files.insert(lower.clone(), Default::default());
+                    }
+
+                    let files = files.get_mut(lower).unwrap();
+                    files.insert(line.line_start, line);
+                }
+            }
+        }
+
+        Ok(Self {
+            exe_path: config.exes[0].clone(),
+            exe_bytes: Pin::new(exe_bytes.into_boxed_slice()),
+            exe_capstone: Capstone::new().x86().mode(arch::x86::ArchMode::Mode64).build().unwrap(),
+            pdb,
+            files,
+        })
+    }
+}
+
+fn build_refs<'a>(cache: &'a ExeCache, cache_refs: &'a mut ExeCacheRefs<'a>) -> anyhow::Result<()> {
+    // Parse exe bytes
+    cache_refs.exe_parsed = PE::parse(&cache.exe_bytes)?;
+
+    // Get instructions
+    let text_section = cache_refs
+        .exe_parsed
+        .sections
+        .iter()
+        .find(|s| s.name().unwrap() == ".text")
+        .ok_or_else(|| anyhow!("Could not find text section"))?;
+    let bytes = &cache.exe_bytes[text_section.pointer_to_raw_data as usize..text_section.size_of_raw_data as usize];
+    cache_refs.exe_instructions = cache.exe_capstone.disasm_all(bytes, text_section.virtual_address as u64)?;
+
+    // Store map of address->instruction
+    for inst in cache_refs.exe_instructions.iter() {
+        cache_refs.exe_instructions_sorted.insert(inst.address(), inst);
+    }
+
+    Ok(())
+}
+*/
+
+/*
 struct Cache<'a> {
     exe_cache: ExeCache<'a>,
 }
 
 struct ExeCache<'a> {
     exe_path: PathBuf,
-    exe_bytes: Vec<u8>,
+    exe_bytes: Pin<Box<[u8]>>,
+
     exe_parsed: goblin::pe::PE<'a>,
     exe_capstone: capstone::Capstone,
-    exe_instructions: capstone::Instructions<'a>,
-    exe_instructions2: &'a [capstone::Insn<'a>],
-    exe_instructions3: (* const capstone::Insn<'a>, usize),
-    exe_instructions_sorted: HashMap<u64, &'a capstone::Insn<'a>>,
 
     pdb: pdb::PDB<'a, File>,
     files: HashMap<String, HashMap<u32, pdb::LineInfo>>,
+
+    exe_instructions: capstone::Instructions<'static>,
+    exe_instructions_sorted: HashMap<u64, &'static capstone::Insn<'static>>,
 }
 
 fn _cache_config(config: &Config, cache: &mut Cache) -> anyhow::Result<()> {
     cache.exe_cache.exe_path = config.exes[0].clone();
-    cache.exe_cache.exe_bytes = std::fs::read(&cache.exe_cache.exe_path)?;
+    let exe_bytes = std::fs::read(&cache.exe_cache.exe_path)?;
+    cache.exe_cache.exe_bytes = Pin::new(exe_bytes.into_boxed_slice());
 
     // Parse EXE
     // unsafe: rust is stupid
@@ -115,19 +302,15 @@ fn _cache_config(config: &Config, cache: &mut Cache) -> anyhow::Result<()> {
         .ok_or_else(|| anyhow!("Could not find text section"))?;
     let bytes = &cache.exe_cache.exe_bytes[text_section.pointer_to_raw_data as usize..text_section.size_of_raw_data as usize];
     let x = cache.exe_cache.exe_capstone.disasm_all(bytes, text_section.virtual_address as u64)?;
-    let p = x.as_ptr();
-    let l = x.len();
-    unsafe { 
-        let mut y : &[capstone::Insn] = Default::default();
-        y = std::slice::from_raw_parts(x.as_ptr(), x.len());
-        //cache.exe_cache.exe_instructions2 = std::slice::from_raw_parts(x.as_ptr(), x.len());
-        cache.exe_cache.exe_instructions3 = (x.as_ptr(), x.len());
-        //cache.exe_cache.exe_instructions = 
+    unsafe {
+        let y = std::slice::from_raw_parts(x.as_ptr(), x.len());
+        cache.exe_cache.exe_instructions = std::mem::transmute(y);
     }
-    //cache.exe_cache.exe_instructions = cache.exe_cache.exe_capstone.disasm_all(bytes, text_section.virtual_address as u64)?;
 
     for inst in cache.exe_cache.exe_instructions.iter() {
-        cache.exe_cache.exe_instructions_sorted.insert(inst.address(), inst);
+        unsafe {
+            cache.exe_cache.exe_instructions_sorted.insert(inst.address(), std::mem::transmute(inst));
+        }
     }
 
     // Parse and cache PDB
@@ -171,6 +354,7 @@ fn _cache_config(config: &Config, cache: &mut Cache) -> anyhow::Result<()> {
 
     Ok(())
 }
+*/
 
 async fn handle_request(req: Request, connection: &Connection, config: &Config) {
     if let Ok((id, params)) = req.extract::<GotoDefinitionParams>("textDocument/definition") {

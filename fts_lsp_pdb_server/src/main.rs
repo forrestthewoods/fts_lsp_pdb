@@ -17,26 +17,47 @@ use symbolic::debuginfo::Archive;
 use symbolic::symcache::{SymCache, SymCacheConverter};
 use tokio::runtime::Runtime;
 
+// Config that comes from VSCode Extension
 #[derive(Clone, Default, serde::Deserialize)]
 struct Config {
-    exes: Vec<PathBuf>,
     pdbs: Vec<PathBuf>,
 }
 
-struct ExeCache {
-    //exe_path: PathBuf,
-    exe_bytes: Pin<Box<[u8]>>,
+// Cache Root
+struct Cache {
+    exe_caches: Vec<ExeCache>
+}
 
+// Cache for a single exe/PDB
+self_cell::self_cell!(
+    struct ExeCache {
+        owner: ExeCacheOwner,
+
+        #[covariant]
+        dependent: ExeCacheRefs,
+    }
+);
+
+struct ExeCacheOwner {
+    exe_bytes: Pin<Box<[u8]>>,
     exe_capstone: capstone::Capstone,
 
     pdb_path: PathBuf,
-    //pdb: pdb::PDB<'a, File>,
     files: HashMap<String, HashMap<u32, pdb::LineInfo>>,
 
     symcache_bytes: Pin<Box<[u8]>>,
 }
 
-struct ExeCacheRefs<'a> {
+self_cell::self_cell!(
+    struct ExeCacheRefs<'a> {
+        owner: ExeCacheRefs1<'a>,
+
+        #[covariant]
+        dependent: ExeCacheRefs2,
+    }
+);
+
+struct ExeCacheRefs1<'a> {
     exe_parsed: goblin::pe::PE<'a>,
     exe_instructions: capstone::Instructions<'a>,
     symcache: SymCache<'a>,
@@ -46,23 +67,6 @@ struct ExeCacheRefs2<'a> {
     exe_instructions_sorted: HashMap<u64, &'a capstone::Insn<'a>>,
 }
 
-self_cell::self_cell!(
-    struct Cache {
-        owner: ExeCache,
-
-        #[covariant]
-        dependent: CacheRefs,
-    }
-);
-
-self_cell::self_cell!(
-    struct CacheRefs<'a> {
-        owner: ExeCacheRefs<'a>,
-
-        #[covariant]
-        dependent: ExeCacheRefs2,
-    }
-);
 
 fn main() {
     let rt = Runtime::new().unwrap();
@@ -120,101 +124,110 @@ fn main() {
 }
 
 fn build_cache(config: Config) -> anyhow::Result<Cache> {
-    let exe_path = config.exes[0].clone();
-    let pdb_path = config.pdbs[0].clone();
-    let exe_bytes = std::fs::read(&exe_path)?;
-    let cs = Capstone::new().x86().mode(arch::x86::ArchMode::Mode64).build()?;
-    let pdb_file = File::open(&pdb_path)?;
-    let mut pdb = PDB::open(pdb_file)?;
+    let mut exe_caches : Vec<ExeCache> = Default::default();
 
-    // Pre-process PDB
-    let di = pdb.debug_information()?;
-    let string_table = pdb.string_table()?;
-    let mut modules = di.modules()?;
+    for pdb_path in config.pdbs {
+        let mut exe_path = pdb_path.clone();
+        exe_path.set_extension("exe");
 
-    let mut file_name_lower: HashMap<pdb::RawString, String> = Default::default();
-    let mut files: HashMap<String, HashMap<u32, pdb::LineInfo>> = Default::default();
-    while let Some(module) = modules.next()? {
-        let info = pdb.module_info(&module)?.unwrap();
-        let line_program = info.line_program()?;
+        let exe_bytes = std::fs::read(&exe_path)?;
+        let cs = Capstone::new().x86().mode(arch::x86::ArchMode::Mode64).build()?;
+        let pdb_file = File::open(&pdb_path)?;
+        let mut pdb = PDB::open(pdb_file)?;
 
-        let mut lines = line_program.lines();
-        while let Some(line) = lines.next()? {
-            let file_info = line_program.get_file_info(line.file_index)?;
-            let file_name = string_table.get(file_info.name)?;
+        // Pre-process PDB
+        let di = pdb.debug_information()?;
+        let string_table = pdb.string_table()?;
+        let mut modules = di.modules()?;
 
-            // Try to ensure entry
-            if !file_name_lower.contains_key(&file_name) {
-                if let Ok(pb) = PathBuf::from_str(&file_name.to_string()) {
-                    if let Some(lower) = pb.to_str().and_then(|s| Some(s.to_lowercase())) {
-                        file_name_lower.insert(file_name, lower);
+        let mut file_name_lower: HashMap<pdb::RawString, String> = Default::default();
+        let mut files: HashMap<String, HashMap<u32, pdb::LineInfo>> = Default::default();
+        while let Some(module) = modules.next()? {
+            let info = pdb.module_info(&module)?.unwrap();
+            let line_program = info.line_program()?;
+
+            let mut lines = line_program.lines();
+            while let Some(line) = lines.next()? {
+                let file_info = line_program.get_file_info(line.file_index)?;
+                let file_name = string_table.get(file_info.name)?;
+
+                // Try to ensure entry
+                if !file_name_lower.contains_key(&file_name) {
+                    if let Ok(pb) = PathBuf::from_str(&file_name.to_string()) {
+                        if let Some(lower) = pb.to_str().and_then(|s| Some(s.to_lowercase())) {
+                            file_name_lower.insert(file_name, lower);
+                        }
                     }
                 }
-            }
 
-            if let Some(lower) = file_name_lower.get(&file_name) {
-                if !files.contains_key(lower) {
-                    files.insert(lower.clone(), Default::default());
+                if let Some(lower) = file_name_lower.get(&file_name) {
+                    if !files.contains_key(lower) {
+                        files.insert(lower.clone(), Default::default());
+                    }
+
+                    files.get_mut(lower).unwrap().insert(line.line_start, line);
                 }
-
-                files.get_mut(lower).unwrap().insert(line.line_start, line);
             }
         }
+
+        // Create SymCache
+        let dsym_path = pdb_path.resolve_dsym();
+        let byteview = ByteView::open(dsym_path.as_deref().unwrap_or_else(|| pdb_path.as_ref()))?;
+
+        let fat_obj = Archive::parse(&byteview)?;
+        let objects_result: Result<Vec<_>, _> = fat_obj.objects().collect();
+        let objects = objects_result?;
+        if objects.len() != 1 {
+            anyhow::bail!("Error initializing symcache. Expected 1 object found {}", objects.len());
+        }
+        let obj = &objects[0];
+
+        let mut converter = SymCacheConverter::new();
+        converter.process_object(obj)?;
+
+        let mut symcache_bytes = Vec::new();
+        converter.serialize(&mut std::io::Cursor::new(&mut symcache_bytes))?;
+
+        // Construct Cache
+        let new_exe_cache = ExeCache::new(
+            ExeCacheOwner {
+                //exe_path,
+                exe_bytes: Pin::new(exe_bytes.into_boxed_slice()),
+                exe_capstone: cs,
+                pdb_path,
+                //pdb,
+                files,
+                symcache_bytes: Pin::new(symcache_bytes.into_boxed_slice()),
+            },
+            |exe_cache| -> ExeCacheRefs {
+                let pe = PE::parse(&exe_cache.exe_bytes).unwrap();
+
+                let text_section = pe.sections.iter().find(|s| s.name().unwrap() == ".text").unwrap();
+                let bytes = &exe_cache.exe_bytes[text_section.pointer_to_raw_data as usize..text_section.size_of_raw_data as usize];
+                let exe_instructions = exe_cache.exe_capstone.disasm_all(bytes, text_section.virtual_address as u64).unwrap();
+
+                ExeCacheRefs::new(
+                    ExeCacheRefs1 {
+                        exe_parsed: pe,
+                        exe_instructions,
+                        symcache: SymCache::parse(&exe_cache.symcache_bytes).unwrap(),
+                    },
+                    move |refs| {
+                        let mut exe_instructions_sorted: HashMap<u64, &capstone::Insn> = Default::default();
+                        for inst in refs.exe_instructions.iter() {
+                            exe_instructions_sorted.insert(inst.address(), inst);
+                        }
+
+                        ExeCacheRefs2 { exe_instructions_sorted }
+                    },
+                )
+            },
+        );
+
+        exe_caches.push(new_exe_cache);
     }
 
-    // Create SymCache
-    let dsym_path = pdb_path.resolve_dsym();
-    let byteview = ByteView::open(dsym_path.as_deref().unwrap_or_else(|| pdb_path.as_ref()))?;
-
-    let fat_obj = Archive::parse(&byteview)?;
-    let objects_result: Result<Vec<_>, _> = fat_obj.objects().collect();
-    let objects = objects_result?;
-    if objects.len() != 1 {
-        anyhow::bail!("Error initializing symcache. Expected 1 object found {}", objects.len());
-    }
-    let obj = &objects[0];
-
-    let mut converter = SymCacheConverter::new();
-    converter.process_object(obj)?;
-
-    let mut symcache_bytes = Vec::new();
-    converter.serialize(&mut std::io::Cursor::new(&mut symcache_bytes))?;
-
-    // Construct Cache
-    Ok(Cache::new(
-        ExeCache {
-            //exe_path,
-            exe_bytes: Pin::new(exe_bytes.into_boxed_slice()),
-            exe_capstone: cs,
-            pdb_path,
-            //pdb,
-            files,
-            symcache_bytes: Pin::new(symcache_bytes.into_boxed_slice()),
-        },
-        |exe_cache| -> CacheRefs {
-            let pe = PE::parse(&exe_cache.exe_bytes).unwrap();
-
-            let text_section = pe.sections.iter().find(|s| s.name().unwrap() == ".text").unwrap();
-            let bytes = &exe_cache.exe_bytes[text_section.pointer_to_raw_data as usize..text_section.size_of_raw_data as usize];
-            let exe_instructions = exe_cache.exe_capstone.disasm_all(bytes, text_section.virtual_address as u64).unwrap();
-
-            CacheRefs::new(
-                ExeCacheRefs {
-                    exe_parsed: pe,
-                    exe_instructions,
-                    symcache: SymCache::parse(&exe_cache.symcache_bytes).unwrap(),
-                },
-                move |refs| {
-                    let mut exe_instructions_sorted: HashMap<u64, &capstone::Insn> = Default::default();
-                    for inst in refs.exe_instructions.iter() {
-                        exe_instructions_sorted.insert(inst.address(), inst);
-                    }
-
-                    ExeCacheRefs2 { exe_instructions_sorted }
-                },
-            )
-        },
-    ))
+    Ok(Cache{exe_caches})
 }
 
 async fn handle_request(req: Request, connection: &Connection, cache: &Cache) {

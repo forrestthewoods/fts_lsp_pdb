@@ -126,104 +126,108 @@ fn build_cache(config: Config) -> anyhow::Result<Cache> {
     let mut exe_caches : Vec<ExeCache> = Default::default();
 
     for pdb_path in config.pdbs {
-        let mut exe_path = pdb_path.clone();
-        exe_path.set_extension("exe");
+        let new_exe_cache = || -> anyhow::Result<ExeCache> {
+            let mut exe_path = pdb_path.clone();
+            exe_path.set_extension("exe");
 
-        let exe_bytes = std::fs::read(&exe_path)?;
-        let cs = Capstone::new().x86().mode(arch::x86::ArchMode::Mode64).build()?;
-        let pdb_file = File::open(&pdb_path)?;
-        let mut pdb = PDB::open(pdb_file)?;
+            let exe_bytes = std::fs::read(&exe_path)?;
+            let cs = Capstone::new().x86().mode(arch::x86::ArchMode::Mode64).build()?;
+            let pdb_file = File::open(&pdb_path)?;
+            let mut pdb = PDB::open(pdb_file)?;
 
-        // Pre-process PDB
-        let di = pdb.debug_information()?;
-        let string_table = pdb.string_table()?;
-        let mut modules = di.modules()?;
+            // Pre-process PDB
+            let di = pdb.debug_information()?;
+            let string_table = pdb.string_table()?;
+            let mut modules = di.modules()?;
 
-        let mut file_name_lower: HashMap<pdb::RawString, String> = Default::default();
-        let mut files: HashMap<String, HashMap<u32, pdb::LineInfo>> = Default::default();
-        while let Some(module) = modules.next()? {
-            let info = pdb.module_info(&module)?.unwrap();
-            let line_program = info.line_program()?;
+            let mut file_name_lower: HashMap<pdb::RawString, String> = Default::default();
+            let mut files: HashMap<String, HashMap<u32, pdb::LineInfo>> = Default::default();
+            while let Some(module) = modules.next()? {
+                let info = pdb.module_info(&module)?.ok_or_else(|| anyhow::anyhow!("Failed to get PDB module info"))?;
+                let line_program = info.line_program()?;
 
-            let mut lines = line_program.lines();
-            while let Some(line) = lines.next()? {
-                let file_info = line_program.get_file_info(line.file_index)?;
-                let file_name = string_table.get(file_info.name)?;
+                let mut lines = line_program.lines();
+                while let Some(line) = lines.next()? {
+                    let file_info = line_program.get_file_info(line.file_index)?;
+                    let file_name = string_table.get(file_info.name)?;
 
-                // Try to ensure entry
-                if !file_name_lower.contains_key(&file_name) {
-                    if let Ok(pb) = PathBuf::from_str(&file_name.to_string()) {
-                        if let Some(lower) = pb.to_str().and_then(|s| Some(s.to_lowercase())) {
-                            file_name_lower.insert(file_name, lower);
+                    // Try to ensure entry
+                    if !file_name_lower.contains_key(&file_name) {
+                        if let Ok(pb) = PathBuf::from_str(&file_name.to_string()) {
+                            if let Some(lower) = pb.to_str().and_then(|s| Some(s.to_lowercase())) {
+                                file_name_lower.insert(file_name, lower);
+                            }
                         }
                     }
-                }
 
-                if let Some(lower) = file_name_lower.get(&file_name) {
-                    if !files.contains_key(lower) {
-                        files.insert(lower.clone(), Default::default());
+                    if let Some(lower) = file_name_lower.get(&file_name) {
+                        if !files.contains_key(lower) {
+                            files.insert(lower.clone(), Default::default());
+                        }
+
+                        files.get_mut(lower).unwrap().insert(line.line_start, line);
                     }
-
-                    files.get_mut(lower).unwrap().insert(line.line_start, line);
                 }
             }
+
+            // Create SymCache
+            let dsym_path = pdb_path.resolve_dsym();
+            let byteview = ByteView::open(dsym_path.as_deref().unwrap_or_else(|| pdb_path.as_ref()))?;
+
+            let fat_obj = Archive::parse(&byteview)?;
+            let objects_result: Result<Vec<_>, _> = fat_obj.objects().collect();
+            let objects = objects_result?;
+            if objects.len() != 1 {
+                anyhow::bail!("Error initializing symcache. Expected 1 object found {}", objects.len());
+            }
+            let obj = &objects[0];
+
+            let mut converter = SymCacheConverter::new();
+            converter.process_object(obj)?;
+
+            let mut symcache_bytes = Vec::new();
+            converter.serialize(&mut std::io::Cursor::new(&mut symcache_bytes))?;
+
+            // Construct Cache
+            Ok(ExeCache::new(
+                ExeCacheOwner {
+                    //exe_path,
+                    exe_bytes: Pin::new(exe_bytes.into_boxed_slice()),
+                    exe_capstone: cs,
+                    pdb_path,
+                    //pdb,
+                    files,
+                    symcache_bytes: Pin::new(symcache_bytes.into_boxed_slice()),
+                },
+                |exe_cache| -> ExeCacheRefs {
+                    let pe = PE::parse(&exe_cache.exe_bytes).unwrap();
+
+                    let text_section = pe.sections.iter().find(|s| s.name().unwrap() == ".text").unwrap();
+                    let bytes = &exe_cache.exe_bytes[text_section.pointer_to_raw_data as usize..text_section.size_of_raw_data as usize];
+                    let exe_instructions = exe_cache.exe_capstone.disasm_all(bytes, text_section.virtual_address as u64).unwrap();
+
+                    ExeCacheRefs::new(
+                        ExeCacheRefs1 {
+                            exe_parsed: pe,
+                            exe_instructions,
+                            symcache: SymCache::parse(&exe_cache.symcache_bytes).unwrap(),
+                        },
+                        move |refs| {
+                            let mut exe_instructions_sorted: HashMap<u64, &capstone::Insn> = Default::default();
+                            for inst in refs.exe_instructions.iter() {
+                                exe_instructions_sorted.insert(inst.address(), inst);
+                            }
+
+                            ExeCacheRefs2 { exe_instructions_sorted }
+                        },
+                    )
+                })
+            )
+        }();
+
+        if let Ok(e) = new_exe_cache {
+            exe_caches.push(e);
         }
-
-        // Create SymCache
-        let dsym_path = pdb_path.resolve_dsym();
-        let byteview = ByteView::open(dsym_path.as_deref().unwrap_or_else(|| pdb_path.as_ref()))?;
-
-        let fat_obj = Archive::parse(&byteview)?;
-        let objects_result: Result<Vec<_>, _> = fat_obj.objects().collect();
-        let objects = objects_result?;
-        if objects.len() != 1 {
-            anyhow::bail!("Error initializing symcache. Expected 1 object found {}", objects.len());
-        }
-        let obj = &objects[0];
-
-        let mut converter = SymCacheConverter::new();
-        converter.process_object(obj)?;
-
-        let mut symcache_bytes = Vec::new();
-        converter.serialize(&mut std::io::Cursor::new(&mut symcache_bytes))?;
-
-        // Construct Cache
-        let new_exe_cache = ExeCache::new(
-            ExeCacheOwner {
-                //exe_path,
-                exe_bytes: Pin::new(exe_bytes.into_boxed_slice()),
-                exe_capstone: cs,
-                pdb_path,
-                //pdb,
-                files,
-                symcache_bytes: Pin::new(symcache_bytes.into_boxed_slice()),
-            },
-            |exe_cache| -> ExeCacheRefs {
-                let pe = PE::parse(&exe_cache.exe_bytes).unwrap();
-
-                let text_section = pe.sections.iter().find(|s| s.name().unwrap() == ".text").unwrap();
-                let bytes = &exe_cache.exe_bytes[text_section.pointer_to_raw_data as usize..text_section.size_of_raw_data as usize];
-                let exe_instructions = exe_cache.exe_capstone.disasm_all(bytes, text_section.virtual_address as u64).unwrap();
-
-                ExeCacheRefs::new(
-                    ExeCacheRefs1 {
-                        exe_parsed: pe,
-                        exe_instructions,
-                        symcache: SymCache::parse(&exe_cache.symcache_bytes).unwrap(),
-                    },
-                    move |refs| {
-                        let mut exe_instructions_sorted: HashMap<u64, &capstone::Insn> = Default::default();
-                        for inst in refs.exe_instructions.iter() {
-                            exe_instructions_sorted.insert(inst.address(), inst);
-                        }
-
-                        ExeCacheRefs2 { exe_instructions_sorted }
-                    },
-                )
-            },
-        );
-
-        exe_caches.push(new_exe_cache);
     }
 
     Ok(Cache{exe_caches})
@@ -293,15 +297,15 @@ async fn goto_definition(params: GotoDefinitionParams, cache: &Cache) -> anyhow:
                         let offset = i32::from_le_bytes([offset_bytes[0], offset_bytes[1], offset_bytes[2], offset_bytes[3]]);
                         let _maybe_target_address = (instruction.address() as i64 + instruction.len() as i64) + (offset as i64);
 
-                        let op_str = instruction.op_str().unwrap();
-                        let mut target_address = u64::from_str_radix(op_str.trim_start_matches("0x"), 16).unwrap();
+                        let op_str = instruction.op_str().ok_or_else(|| anyhow::anyhow!("No op str"))?;
+                        let mut target_address = u64::from_str_radix(op_str.trim_start_matches("0x"), 16)?;
 
                         // lookup target instruction, may be jmp
                         let maybe_inst = exe_cache.borrow_dependent().borrow_dependent().exe_instructions_sorted.get(&target_address);
                         if let Some(instruction) = maybe_inst {
                             if instruction.mnemonic().unwrap_or_default() == "jmp" {
-                                let op_str = instruction.op_str().unwrap();
-                                let new_target_address = u64::from_str_radix(op_str.trim_start_matches("0x"), 16).unwrap();
+                                let op_str = instruction.op_str().ok_or_else(|| anyhow::anyhow!("No op str"))?;
+                                let new_target_address = u64::from_str_radix(op_str.trim_start_matches("0x"), 16)?;
                                 //println!("    Remapping call 0x{:x} to 0x{:x}", target_address, new_target_address);
                                 target_address = new_target_address;
                             }

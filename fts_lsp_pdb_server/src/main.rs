@@ -8,7 +8,6 @@ use normpath::PathExt;
 use pdb::{FallibleIterator, PDB};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::Write;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::str::FromStr;
@@ -25,7 +24,7 @@ struct Config {
 
 // Cache Root
 struct Cache {
-    exe_caches: Vec<ExeCache>
+    exe_caches: Vec<ExeCache>,
 }
 
 // Cache for a single exe/PDB
@@ -66,7 +65,6 @@ struct ExeCacheRefs1<'a> {
 struct ExeCacheRefs2<'a> {
     exe_instructions_sorted: HashMap<u64, &'a capstone::Insn<'a>>,
 }
-
 
 fn main() {
     let rt = Runtime::new().unwrap();
@@ -123,16 +121,16 @@ fn main() {
 }
 
 fn build_cache(config: Config) -> anyhow::Result<Cache> {
-    let mut debug_log = std::fs::OpenOptions::new().create(true).append(true).open("c:/temp/hack_log.txt")?;
+    //let mut debug_log = std::fs::OpenOptions::new().create(true).append(true).open("c:/temp/hack_log.txt")?;
 
-    let mut exe_caches : Vec<ExeCache> = Default::default();
+    let mut exe_caches: Vec<ExeCache> = Default::default();
 
     for pdb_path in config.pdbs {
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(||{
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let new_exe_cache = || -> anyhow::Result<ExeCache> {
                 let mut exe_path = pdb_path.clone();
                 exe_path.set_extension("exe");
-                debug_log.write_fmt(format_args!("{}\n", pdb_path.to_string_lossy()))?;
+                //debug_log.write_fmt(format_args!("{}\n", pdb_path.to_string_lossy()))?;
 
                 let exe_bytes = std::fs::read(&exe_path)?;
                 let cs = Capstone::new().x86().mode(arch::x86::ArchMode::Mode64).build()?;
@@ -145,10 +143,18 @@ fn build_cache(config: Config) -> anyhow::Result<Cache> {
                 let mut modules = di.modules()?;
 
                 let mut file_name_lower: HashMap<pdb::RawString, String> = Default::default();
-                let mut file_name_excluded : HashSet<pdb::RawString> = Default::default();
+                let mut file_name_excluded: HashSet<pdb::RawString> = Default::default();
                 let mut files: HashMap<String, HashMap<u32, pdb::LineInfo>> = Default::default();
                 while let Some(module) = modules.next()? {
-                    let info = pdb.module_info(&module)?.ok_or_else(|| anyhow::anyhow!("Failed to get PDB module info"))?;
+                    let info = pdb.module_info(&module)?.ok_or_else(|| anyhow::anyhow!("Failed to get PDB module info"));
+
+                    let info = match info {
+                        Ok(i) => i,
+                        Err(_) => {
+                            continue;
+                        }
+                    };
+
                     let line_program = info.line_program()?;
 
                     let mut lines = line_program.lines();
@@ -164,9 +170,8 @@ fn build_cache(config: Config) -> anyhow::Result<Cache> {
                         if !file_name_lower.contains_key(&file_name) {
                             if let Ok(pb) = PathBuf::from_str(&file_name.to_string()).unwrap().normalize() {
                                 if let Some(lower) = pb.as_path().to_str().and_then(|s| Some(s.to_lowercase())) {
-                                    debug_log.write_fmt(format_args!("    {}\n", &lower))?;
+                                    //debug_log.write_fmt(format_args!("    {}\n", &lower))?;
                                     file_name_lower.insert(file_name, lower);
-
                                 }
                             } else {
                                 file_name_excluded.insert(file_name.clone());
@@ -234,18 +239,26 @@ fn build_cache(config: Config) -> anyhow::Result<Cache> {
                                 ExeCacheRefs2 { exe_instructions_sorted }
                             },
                         )
-                    })
-                )
+                    },
+                ))
             }();
 
-            if let Ok(e) = new_exe_cache {
-                exe_caches.push(e);
+            match new_exe_cache {
+                Ok(c) => exe_caches.push(c),
+                Err(_e) => {
+                    //let _ = debug_log.write_fmt(format_args!("Error: {}\n", _e.to_string()));
+                }
             }
         }));
+
+        if let Err(err) = result {
+            let _panic_msg = get_panic_msg(&err);
+            //debug_log.write_fmt(format_args!("PANIC! {}\n", _panic_msg))?;
+        }
     }
 
-    debug_log.write_all(b"Build Cache Complete\n")?;
-    Ok(Cache{exe_caches})
+    //debug_log.write_all(b"Build Cache Complete\n")?;
+    Ok(Cache { exe_caches })
 }
 
 async fn handle_request(req: Request, connection: &Connection, cache: &Option<Cache>) {
@@ -255,7 +268,7 @@ async fn handle_request(req: Request, connection: &Connection, cache: &Option<Ca
             let response = goto_definition(params, cache);
             let msg = match response {
                 Ok(r) => Response::new_ok(id, r),
-                Err(_e) => Response::new_ok(id, GotoDefinitionResponse::Array(vec![])) // empty array = silent error
+                Err(_e) => Response::new_ok(id, GotoDefinitionResponse::Array(vec![])), // empty array = silent error
             };
             let _ = connection.sender.send(Message::Response(msg));
         });
@@ -270,7 +283,9 @@ async fn handle_request(req: Request, connection: &Connection, cache: &Option<Ca
 fn goto_definition(params: GotoDefinitionParams, cache: &Option<Cache>) -> anyhow::Result<GotoDefinitionResponse> {
     let cache = match cache {
         Some(c) => c,
-        None => { anyhow::bail!("No cache"); }
+        None => {
+            anyhow::bail!("No cache");
+        }
     };
 
     //let mut debug_log = std::fs::OpenOptions::new().create(true).append(true).open("c:/temp/hack_log.txt")?;
@@ -315,8 +330,8 @@ fn goto_definition(params: GotoDefinitionParams, cache: &Option<Cache>) -> anyho
             if let Some(section) = section {
                 let offset = (start - section.virtual_address) as usize;
                 let size = (end - start) as usize;
-                let bytes =
-                    &exe_cache.borrow_owner().exe_bytes[section.pointer_to_raw_data as usize + offset..section.pointer_to_raw_data as usize + offset + size];
+                let bytes = &exe_cache.borrow_owner().exe_bytes
+                    [section.pointer_to_raw_data as usize + offset..section.pointer_to_raw_data as usize + offset + size];
                 let instructions = exe_cache.borrow_owner().exe_capstone.disasm_all(bytes, start as u64)?;
 
                 for instruction in instructions.iter() {
@@ -327,7 +342,11 @@ fn goto_definition(params: GotoDefinitionParams, cache: &Option<Cache>) -> anyho
                             let mut target_address = u64::from_str_radix(op_str.trim_start_matches("0x"), 16)?;
 
                             // lookup target instruction, may be jmp
-                            let maybe_inst = exe_cache.borrow_dependent().borrow_dependent().exe_instructions_sorted.get(&target_address);
+                            let maybe_inst = exe_cache
+                                .borrow_dependent()
+                                .borrow_dependent()
+                                .exe_instructions_sorted
+                                .get(&target_address);
                             if let Some(instruction) = maybe_inst {
                                 if instruction.mnemonic().unwrap_or_default() == "jmp" {
                                     let op_str = instruction.op_str().ok_or_else(|| anyhow::anyhow!("No op str"))?;
@@ -344,8 +363,11 @@ fn goto_definition(params: GotoDefinitionParams, cache: &Option<Cache>) -> anyho
                             }
 
                             let source_loc = &m[0];
-                            let path = source_loc.file().map(|file| file.full_path()).ok_or_else(|| anyhow::anyhow!("<unknown file>"))?;
-                            
+                            let path = source_loc
+                                .file()
+                                .map(|file| file.full_path())
+                                .ok_or_else(|| anyhow::anyhow!("<unknown file>"))?;
+
                             if let Ok(real_path) = PathBuf::from_str(&path).unwrap().normalize() {
                                 let line = source_loc.line();
                                 Ok((real_path.as_path().to_string_lossy().to_string(), line))
@@ -400,11 +422,9 @@ fn goto_definition(params: GotoDefinitionParams, cache: &Option<Cache>) -> anyho
 fn get_panic_msg(err: &Box<dyn std::any::Any + Send>) -> String {
     if let Some(panic_msg) = err.downcast_ref::<&str>() {
         panic_msg.to_string()
-    } 
-    else if let Some(panic_msg) = err.downcast_ref::<String>() {
+    } else if let Some(panic_msg) = err.downcast_ref::<String>() {
         panic_msg.clone()
-    } 
-    else {
+    } else {
         "Unknown panic".to_owned()
     }
 }

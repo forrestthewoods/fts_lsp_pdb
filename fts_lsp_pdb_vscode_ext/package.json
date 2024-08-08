@@ -25,11 +25,6 @@
 			"type": "object",
 			"title": "fts_lsp_pdb",
 			"properties": {
-				"fts_lsp_pdb.exes": {
-					"type": "array",
-					"default": [],
-					"description": "Array of paths to executables"
-				},
 				"fts_lsp_pdb.pdbs": {
 					"type": "array",
 					"default": [],

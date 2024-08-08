@@ -6,8 +6,9 @@ use lsp_server::{Connection, Message, Request, Response};
 use lsp_types::{GotoDefinitionParams, GotoDefinitionResponse, InitializeResult, Position, ServerCapabilities};
 use normpath::PathExt;
 use pdb::{FallibleIterator, PDB};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
+use std::io::Write;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::str::FromStr;
@@ -101,12 +102,11 @@ fn main() {
                     if connection.handle_shutdown(&req).unwrap() {
                         return;
                     }
-                    if let Some(ref c) = cache {
-                        handle_request(req, &connection, c).await;
-                    }
+
+                    handle_request(req, &connection, &cache).await;
                 }
                 Message::Notification(notif) => match notif.method.as_str() {
-                    "workspace/didChangeConfiguration" => {
+                    "workspace/updateConfig" => {
                         if let Ok(config) = serde_json::from_value::<Config>(notif.params) {
                             cache = build_cache(config).ok();
                         }
@@ -123,12 +123,15 @@ fn main() {
 }
 
 fn build_cache(config: Config) -> anyhow::Result<Cache> {
+    let mut debug_log = std::fs::OpenOptions::new().create(true).append(true).open("c:/temp/hack_log.txt")?;
+
     let mut exe_caches : Vec<ExeCache> = Default::default();
 
     for pdb_path in config.pdbs {
         let new_exe_cache = || -> anyhow::Result<ExeCache> {
             let mut exe_path = pdb_path.clone();
             exe_path.set_extension("exe");
+            debug_log.write_fmt(format_args!("{}\n", pdb_path.to_string_lossy()))?;
 
             let exe_bytes = std::fs::read(&exe_path)?;
             let cs = Capstone::new().x86().mode(arch::x86::ArchMode::Mode64).build()?;
@@ -141,6 +144,7 @@ fn build_cache(config: Config) -> anyhow::Result<Cache> {
             let mut modules = di.modules()?;
 
             let mut file_name_lower: HashMap<pdb::RawString, String> = Default::default();
+            let mut file_name_excluded : HashSet<pdb::RawString> = Default::default();
             let mut files: HashMap<String, HashMap<u32, pdb::LineInfo>> = Default::default();
             while let Some(module) = modules.next()? {
                 let info = pdb.module_info(&module)?.ok_or_else(|| anyhow::anyhow!("Failed to get PDB module info"))?;
@@ -151,12 +155,20 @@ fn build_cache(config: Config) -> anyhow::Result<Cache> {
                     let file_info = line_program.get_file_info(line.file_index)?;
                     let file_name = string_table.get(file_info.name)?;
 
+                    if file_name_excluded.contains(&file_name) {
+                        continue;
+                    }
+
                     // Try to ensure entry
                     if !file_name_lower.contains_key(&file_name) {
-                        if let Ok(pb) = PathBuf::from_str(&file_name.to_string()) {
-                            if let Some(lower) = pb.to_str().and_then(|s| Some(s.to_lowercase())) {
+                        if let Ok(pb) = PathBuf::from_str(&file_name.to_string()).unwrap().normalize() {
+                            if let Some(lower) = pb.as_path().to_str().and_then(|s| Some(s.to_lowercase())) {
+                                debug_log.write_fmt(format_args!("    {}\n", &lower))?;
                                 file_name_lower.insert(file_name, lower);
+
                             }
+                        } else {
+                            file_name_excluded.insert(file_name.clone());
                         }
                     }
 
@@ -230,18 +242,27 @@ fn build_cache(config: Config) -> anyhow::Result<Cache> {
         }
     }
 
+    debug_log.write_all(b"Build Cache Complete\n")?;
     Ok(Cache{exe_caches})
 }
 
-async fn handle_request(req: Request, connection: &Connection, cache: &Cache) {
+async fn handle_request(req: Request, connection: &Connection, cache: &Option<Cache>) {
     if let Ok((id, params)) = req.extract::<GotoDefinitionParams>("textDocument/definition") {
         let response = goto_definition(params, cache).await;
-        let resp = Response::new_ok(id, response.ok());
-        connection.sender.send(Message::Response(resp)).unwrap();
+        let msg = match response {
+            Ok(r) => Response::new_ok(id, r),
+            Err(_e) => Response::new_ok(id, GotoDefinitionResponse::Array(vec![])) // empty array = silent error
+        };
+        connection.sender.send(Message::Response(msg)).unwrap();
     }
 }
 
-async fn goto_definition(params: GotoDefinitionParams, cache: &Cache) -> anyhow::Result<GotoDefinitionResponse> {
+async fn goto_definition(params: GotoDefinitionParams, cache: &Option<Cache>) -> anyhow::Result<GotoDefinitionResponse> {
+    let cache = match cache {
+        Some(c) => c,
+        None => { anyhow::bail!("No cache"); }
+    };
+
     //let mut debug_log = std::fs::OpenOptions::new().create(true).append(true).open("c:/temp/hack_log.txt")?;
 
     // Input data
@@ -291,36 +312,51 @@ async fn goto_definition(params: GotoDefinitionParams, cache: &Cache) -> anyhow:
                 for instruction in instructions.iter() {
                     //println!("{}", instruction);
                     if instruction.mnemonic().unwrap_or_default() == "call" {
-                        // looks like op_code performs the relative address computation for us
-                        // maybe_target_address == target_address
-                        let offset_bytes = &instruction.bytes()[1..5];
-                        let offset = i32::from_le_bytes([offset_bytes[0], offset_bytes[1], offset_bytes[2], offset_bytes[3]]);
-                        let _maybe_target_address = (instruction.address() as i64 + instruction.len() as i64) + (offset as i64);
+                        let source_loc = || -> anyhow::Result<(String, u32)> {
+                            // looks like op_code performs the relative address computation for us
+                            // maybe_target_address == target_address
+                            let offset_bytes = &instruction.bytes()[1..5];
+                            let offset = i32::from_le_bytes([offset_bytes[0], offset_bytes[1], offset_bytes[2], offset_bytes[3]]);
+                            let _maybe_target_address = (instruction.address() as i64 + instruction.len() as i64) + (offset as i64);
 
-                        let op_str = instruction.op_str().ok_or_else(|| anyhow::anyhow!("No op str"))?;
-                        let mut target_address = u64::from_str_radix(op_str.trim_start_matches("0x"), 16)?;
+                            let op_str = instruction.op_str().ok_or_else(|| anyhow::anyhow!("No op str"))?;
+                            let mut target_address = u64::from_str_radix(op_str.trim_start_matches("0x"), 16)?;
 
-                        // lookup target instruction, may be jmp
-                        let maybe_inst = exe_cache.borrow_dependent().borrow_dependent().exe_instructions_sorted.get(&target_address);
-                        if let Some(instruction) = maybe_inst {
-                            if instruction.mnemonic().unwrap_or_default() == "jmp" {
-                                let op_str = instruction.op_str().ok_or_else(|| anyhow::anyhow!("No op str"))?;
-                                let new_target_address = u64::from_str_radix(op_str.trim_start_matches("0x"), 16)?;
-                                //println!("    Remapping call 0x{:x} to 0x{:x}", target_address, new_target_address);
-                                target_address = new_target_address;
+                            // lookup target instruction, may be jmp
+                            let maybe_inst = exe_cache.borrow_dependent().borrow_dependent().exe_instructions_sorted.get(&target_address);
+                            if let Some(instruction) = maybe_inst {
+                                if instruction.mnemonic().unwrap_or_default() == "jmp" {
+                                    let op_str = instruction.op_str().ok_or_else(|| anyhow::anyhow!("No op str"))?;
+                                    let new_target_address = u64::from_str_radix(op_str.trim_start_matches("0x"), 16)?;
+                                    //println!("    Remapping call 0x{:x} to 0x{:x}", target_address, new_target_address);
+                                    target_address = new_target_address;
+                                }
                             }
-                        }
 
-                        let symcache = &exe_cache.borrow_dependent().borrow_owner().symcache;
-                        let m = symcache.lookup(target_address).collect::<Vec<_>>();
-                        if m.len() == 0 {
-                            anyhow::bail!("Could not find function at address [0x{:x}]", target_address);
-                        }
+                            let symcache = &exe_cache.borrow_dependent().borrow_owner().symcache;
+                            let m = symcache.lookup(target_address).collect::<Vec<_>>();
+                            if m.len() == 0 {
+                                anyhow::bail!("Could not find function at address [0x{:x}]", target_address);
+                            }
 
-                        let source_loc = &m[0];
-                        let path = source_loc.file().map(|file| file.full_path()).unwrap_or_else(|| "<unknown file>".into());
-                        let line = source_loc.line();
-                        source_locations.push((path, line));
+                            let source_loc = &m[0];
+                            let f = source_loc.file();
+                            let ff = f.map(|f| f.full_path());
+                            dbg!(source_loc);
+                            dbg!(&ff);
+                            let path = source_loc.file().map(|file| file.full_path()).ok_or_else(|| anyhow::anyhow!("<unknown file>"))?;
+                            
+                            if let Ok(real_path) = PathBuf::from_str(&path).unwrap().normalize() {
+                                let line = source_loc.line();
+                                Ok((real_path.as_path().to_string_lossy().to_string(), line))
+                            } else {
+                                anyhow::bail!("Could not resolve source file")
+                            }
+                        }();
+
+                        if let Ok(sl) = source_loc {
+                            source_locations.push(sl);
+                        }
                     }
                 }
             }

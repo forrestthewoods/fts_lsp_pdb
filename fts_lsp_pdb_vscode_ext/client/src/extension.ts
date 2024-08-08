@@ -52,8 +52,7 @@ export function activate(context: ExtensionContext) {
 		workspace.onDidChangeConfiguration(e => {
 			if (e.affectsConfiguration('fts_lsp_pdb')) {
 				const config = workspace.getConfiguration('fts_lsp_pdb');
-				client.sendNotification('workspace/didChangeConfiguration', {
-					exes: config.get('exes'),
+				client.sendNotification('workspace/updateConfig', {
 					pdbs: config.get('pdbs')
 				  });
 			}
@@ -65,8 +64,7 @@ export function activate(context: ExtensionContext) {
 
 	// send config data
 	const config = workspace.getConfiguration('fts_lsp_pdb');
-	client.sendNotification('workspace/didChangeConfiguration', {
-		exes: config.get('exes'),
+	client.sendNotification('workspace/updateConfig', {
 		pdbs: config.get('pdbs')
 	  });
 }

@@ -36,6 +36,8 @@ export function activate(context: ExtensionContext) {
 		documentSelector: [
 			{ scheme: 'file', language: 'cpp' },
 			{ scheme: 'file', language: 'jai' },
+			{ scheme: 'file', pattern: '**/*.odin' },			
+			{ scheme: 'file', pattern: '**/*.odin' },			
 		],
 	};
 

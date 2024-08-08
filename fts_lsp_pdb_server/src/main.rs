@@ -313,12 +313,6 @@ async fn goto_definition(params: GotoDefinitionParams, cache: &Option<Cache>) ->
                     //println!("{}", instruction);
                     if instruction.mnemonic().unwrap_or_default() == "call" {
                         let source_loc = || -> anyhow::Result<(String, u32)> {
-                            // looks like op_code performs the relative address computation for us
-                            // maybe_target_address == target_address
-                            let offset_bytes = &instruction.bytes()[1..5];
-                            let offset = i32::from_le_bytes([offset_bytes[0], offset_bytes[1], offset_bytes[2], offset_bytes[3]]);
-                            let _maybe_target_address = (instruction.address() as i64 + instruction.len() as i64) + (offset as i64);
-
                             let op_str = instruction.op_str().ok_or_else(|| anyhow::anyhow!("No op str"))?;
                             let mut target_address = u64::from_str_radix(op_str.trim_start_matches("0x"), 16)?;
 
@@ -340,10 +334,6 @@ async fn goto_definition(params: GotoDefinitionParams, cache: &Option<Cache>) ->
                             }
 
                             let source_loc = &m[0];
-                            let f = source_loc.file();
-                            let ff = f.map(|f| f.full_path());
-                            dbg!(source_loc);
-                            dbg!(&ff);
                             let path = source_loc.file().map(|file| file.full_path()).ok_or_else(|| anyhow::anyhow!("<unknown file>"))?;
                             
                             if let Ok(real_path) = PathBuf::from_str(&path).unwrap().normalize() {

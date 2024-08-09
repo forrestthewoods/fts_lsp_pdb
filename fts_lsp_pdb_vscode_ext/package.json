@@ -1,5 +1,5 @@
 {
-	"name": "fts_lsp_pdb",
+	"name": "fts-lsp-pdb",
 	"description": "A language server example",
 	"author": "ForrestTheWoods",
 	"license": "MIT",

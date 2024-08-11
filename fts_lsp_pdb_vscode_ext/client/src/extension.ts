@@ -31,13 +31,11 @@ export function activate(context: ExtensionContext) {
 	};
 
 	// Options to control the language client
+	const config = workspace.getConfiguration('fts_lsp_pdb');
 	const clientOptions: LanguageClientOptions = {
-		// Register the server for plain text documents
 		documentSelector: [
-			{ scheme: 'file', language: 'cpp' },
-			{ scheme: 'file', language: 'jai' },
-			{ scheme: 'file', language: 'zig' },			
-			{ scheme: 'file', pattern: '**/*.zig' },			
+			...config.get<string[]>("languages", []).map(lang => ({ scheme: 'file', language: lang })),
+			...config.get<string[]>("file_patterns", []).map(pattern => ({ scheme: 'file', pattern: pattern })),
 		],
 	};
 
@@ -53,9 +51,11 @@ export function activate(context: ExtensionContext) {
 	context.subscriptions.push(
 		workspace.onDidChangeConfiguration(e => {
 			if (e.affectsConfiguration('fts_lsp_pdb')) {
-				const config = workspace.getConfiguration('fts_lsp_pdb');
+				const c = workspace.getConfiguration('fts_lsp_pdb');
+
+				// Refresh LSP server
 				client.sendNotification('workspace/updateConfig', {
-					pdbs: config.get('pdbs')
+					pdbs: c.get('pdbs')
 				  });
 			}
 		})
@@ -65,7 +65,6 @@ export function activate(context: ExtensionContext) {
 	client.start();
 
 	// send config data
-	const config = workspace.getConfiguration('fts_lsp_pdb');
 	client.sendNotification('workspace/updateConfig', {
 		pdbs: config.get('pdbs')
 	  });

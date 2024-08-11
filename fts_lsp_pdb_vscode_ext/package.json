@@ -25,6 +25,16 @@
 			"type": "object",
 			"title": "fts_lsp_pdb",
 			"properties": {
+				"fts_lsp_pdb.languages": {
+					"type": "array",
+					"default": [],
+					"description": "Array of languages to apply intellisense to"
+				},
+				"fts_lsp_pdb.file_patterns": {
+					"type": "array",
+					"default": [],
+					"description": "Array of file patterns to apply intellisense to"
+				},
 				"fts_lsp_pdb.pdbs": {
 					"type": "array",
 					"default": [],

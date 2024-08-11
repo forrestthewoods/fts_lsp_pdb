@@ -44,7 +44,7 @@ struct ExeCacheOwner {
 
     pdb_path: PathBuf,
     pdb_last_modified: u64,
-    files: HashMap<String, HashMap<u32, pdb::LineInfo>>,
+    files: HashMap<String, HashMap<u32, Vec<pdb::LineInfo>>>,
 
     symcache_bytes: Pin<Box<[u8]>>,
 }
@@ -131,12 +131,10 @@ fn build_cache(config: Config) -> anyhow::Result<Cache> {
     let mut exe_caches: Vec<ExeCache> = Default::default();
 
     for pdb_path in config.pdbs {
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            match build_exe_cache(&pdb_path) {
-                Ok(c) => exe_caches.push(c),
-                Err(_e) => {
-                    //let _ = debug_log.write_fmt(format_args!("Error: {}\n", _e.to_string()));
-                }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match build_exe_cache(&pdb_path) {
+            Ok(c) => exe_caches.push(c),
+            Err(_e) => {
+                // let _ = debug_log.write_fmt(format_args!("Error: {}\n", _e.to_string()));
             }
         }));
 
@@ -168,7 +166,7 @@ fn build_exe_cache(pdb_path: &Path) -> anyhow::Result<ExeCache> {
 
     let mut file_name_lower: HashMap<pdb::RawString, String> = Default::default();
     let mut file_name_excluded: HashSet<pdb::RawString> = Default::default();
-    let mut files: HashMap<String, HashMap<u32, pdb::LineInfo>> = Default::default();
+    let mut files: HashMap<String, HashMap<u32, Vec<pdb::LineInfo>>> = Default::default();
     while let Some(module) = modules.next()? {
         let info = pdb.module_info(&module)?.ok_or_else(|| anyhow::anyhow!("Failed to get PDB module info"));
 
@@ -190,7 +188,7 @@ fn build_exe_cache(pdb_path: &Path) -> anyhow::Result<ExeCache> {
                 continue;
             }
 
-            // Try to ensure entry
+            // Ensure entry for filepath
             if !file_name_lower.contains_key(&file_name) {
                 if let Ok(pb) = PathBuf::from_str(&file_name.to_string()).unwrap().normalize() {
                     if let Some(lower) = pb.as_path().to_str().and_then(|s| Some(s.to_lowercase())) {
@@ -199,6 +197,7 @@ fn build_exe_cache(pdb_path: &Path) -> anyhow::Result<ExeCache> {
                     }
                 } else {
                     file_name_excluded.insert(file_name.clone());
+                    continue;
                 }
             }
 
@@ -207,7 +206,7 @@ fn build_exe_cache(pdb_path: &Path) -> anyhow::Result<ExeCache> {
                     files.insert(lower.clone(), Default::default());
                 }
 
-                files.get_mut(lower).unwrap().insert(line.line_start, line);
+                files.get_mut(lower).unwrap().entry(line.line_start).or_default().push(line);
             }
         }
     }
@@ -328,76 +327,80 @@ fn goto_definition(params: GotoDefinitionParams, cache: &Option<Cache>) -> anyho
             let address_map = pdb.address_map()?;
 
             // Find exe address range for (source_file, line_info)
-            let owner = exe_cache.borrow_owner();
-            let files = &owner.files;
-            let (start, end) = if let Some(line) = files.get(&source_file).and_then(|lines| lines.get(&line_number)) {
-                let rva = line
+            let line_infos = exe_cache
+                .borrow_owner()
+                .files
+                .get(&source_file)
+                .and_then(|lines| lines.get(&line_number))
+                .ok_or_else(|| anyhow::anyhow!("Could not fine entry for [{source_file}]:[{line_number}]"))?;
+
+            let mut source_locations: Vec<(String, u32)> = Default::default();
+            for line_info in line_infos {
+                let rva = line_info
                     .offset
                     .to_rva(&address_map)
                     .ok_or_else(|| anyhow!("Could not map line offset to RVA"))?;
-                (rva.0, rva.0 + line.length.unwrap_or_default())
-            } else {
-                anyhow::bail!("Could not fine entry for [{source_file}]:[{line_number}]");
-            };
+                let start = rva.0;
+                let end = rva.0 + line_info.length.unwrap_or_default();
 
-            // Find calls made within line
-            let mut source_locations: Vec<(String, u32)> = Default::default();
-            let pe = &exe_cache.borrow_dependent().borrow_owner().exe_parsed;
-            let section = pe
-                .sections
-                .iter()
-                .find(|sec| sec.virtual_address <= start && start < sec.virtual_address + sec.virtual_size);
-            if let Some(section) = section {
-                let offset = (start - section.virtual_address) as usize;
-                let size = (end - start) as usize;
-                let bytes = &exe_cache.borrow_owner().exe_bytes
-                    [section.pointer_to_raw_data as usize + offset..section.pointer_to_raw_data as usize + offset + size];
-                let instructions = exe_cache.borrow_owner().exe_capstone.disasm_all(bytes, start as u64)?;
+                // Find calls made within line
+                let pe = &exe_cache.borrow_dependent().borrow_owner().exe_parsed;
+                let section = pe
+                    .sections
+                    .iter()
+                    .find(|sec| sec.virtual_address <= start && start < sec.virtual_address + sec.virtual_size);
+                if let Some(section) = section {
+                    let offset = (start - section.virtual_address) as usize;
+                    let size = (end - start) as usize;
+                    let bytes = &exe_cache.borrow_owner().exe_bytes
+                        [section.pointer_to_raw_data as usize + offset..section.pointer_to_raw_data as usize + offset + size];
+                    let instructions = exe_cache.borrow_owner().exe_capstone.disasm_all(bytes, start as u64)?;
 
-                for instruction in instructions.iter() {
-                    //println!("{}", instruction);
-                    if instruction.mnemonic().unwrap_or_default() == "call" {
-                        let source_loc = || -> anyhow::Result<(String, u32)> {
-                            let op_str = instruction.op_str().ok_or_else(|| anyhow::anyhow!("No op str"))?;
-                            let mut target_address = u64::from_str_radix(op_str.trim_start_matches("0x"), 16)?;
+                    for instruction in instructions.iter() {
+                        //println!("{}", instruction);
+                        if instruction.mnemonic().unwrap_or_default() == "call" {
+                            let source_loc = || -> anyhow::Result<(String, u32)> {
+                                let op_str = instruction.op_str().ok_or_else(|| anyhow::anyhow!("No op str"))?;
+                                let mut target_address = u64::from_str_radix(op_str.trim_start_matches("0x"), 16)?;
 
-                            // lookup target instruction, may be jmp
-                            let maybe_inst = exe_cache
-                                .borrow_dependent()
-                                .borrow_dependent()
-                                .exe_instructions_sorted
-                                .get(&target_address);
-                            if let Some(instruction) = maybe_inst {
-                                if instruction.mnemonic().unwrap_or_default() == "jmp" {
-                                    let op_str = instruction.op_str().ok_or_else(|| anyhow::anyhow!("No op str"))?;
-                                    let new_target_address = u64::from_str_radix(op_str.trim_start_matches("0x"), 16)?;
-                                    //println!("    Remapping call 0x{:x} to 0x{:x}", target_address, new_target_address);
-                                    target_address = new_target_address;
+                                // lookup target instruction, may be jmp
+                                let maybe_inst = exe_cache
+                                    .borrow_dependent()
+                                    .borrow_dependent()
+                                    .exe_instructions_sorted
+                                    .get(&target_address);
+                                if let Some(instruction) = maybe_inst {
+                                    if instruction.mnemonic().unwrap_or_default() == "jmp" {
+                                        let op_str = instruction.op_str().ok_or_else(|| anyhow::anyhow!("No op str"))?;
+                                        let new_target_address = u64::from_str_radix(op_str.trim_start_matches("0x"), 16)?;
+                                        //println!("    Remapping call 0x{:x} to 0x{:x}", target_address, new_target_address);
+                                        target_address = new_target_address;
+                                    }
                                 }
+
+                                let symcache = &exe_cache.borrow_dependent().borrow_owner().symcache;
+                                let m = symcache.lookup(target_address).collect::<Vec<_>>();
+                                if m.len() == 0 {
+                                    anyhow::bail!("Could not find function at address [0x{:x}]", target_address);
+                                }
+
+                                let source_loc = &m[0];
+                                let path = source_loc
+                                    .file()
+                                    .map(|file| file.full_path())
+                                    .ok_or_else(|| anyhow::anyhow!("<unknown file>"))?;
+
+                                if let Ok(real_path) = PathBuf::from_str(&path).unwrap().normalize() {
+                                    let line = source_loc.line();
+                                    Ok((real_path.as_path().to_string_lossy().to_string(), line))
+                                } else {
+                                    anyhow::bail!("Could not resolve source file")
+                                }
+                            }();
+
+                            if let Ok(sl) = source_loc {
+                                source_locations.push(sl);
                             }
-
-                            let symcache = &exe_cache.borrow_dependent().borrow_owner().symcache;
-                            let m = symcache.lookup(target_address).collect::<Vec<_>>();
-                            if m.len() == 0 {
-                                anyhow::bail!("Could not find function at address [0x{:x}]", target_address);
-                            }
-
-                            let source_loc = &m[0];
-                            let path = source_loc
-                                .file()
-                                .map(|file| file.full_path())
-                                .ok_or_else(|| anyhow::anyhow!("<unknown file>"))?;
-
-                            if let Ok(real_path) = PathBuf::from_str(&path).unwrap().normalize() {
-                                let line = source_loc.line();
-                                Ok((real_path.as_path().to_string_lossy().to_string(), line))
-                            } else {
-                                anyhow::bail!("Could not resolve source file")
-                            }
-                        }();
-
-                        if let Ok(sl) = source_loc {
-                            source_locations.push(sl);
                         }
                     }
                 }

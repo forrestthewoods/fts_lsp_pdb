@@ -8,7 +8,8 @@ use normpath::PathExt;
 use pdb::{FallibleIterator, PDB};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::path::PathBuf;
+use std::os::windows::fs::MetadataExt;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::str::FromStr;
 use symbolic::common::{ByteView, DSymPathExt};
@@ -42,6 +43,7 @@ struct ExeCacheOwner {
     exe_capstone: capstone::Capstone,
 
     pdb_path: PathBuf,
+    pdb_last_modified: u64,
     files: HashMap<String, HashMap<u32, pdb::LineInfo>>,
 
     symcache_bytes: Pin<Box<[u8]>>,
@@ -101,6 +103,9 @@ fn main() {
                         return;
                     }
 
+                    if let Some(cache) = &mut cache {
+                        refresh_cache(cache);
+                    }
                     handle_request(req, &connection, &cache).await;
                 }
                 Message::Notification(notif) => match notif.method.as_str() {
@@ -127,123 +132,7 @@ fn build_cache(config: Config) -> anyhow::Result<Cache> {
 
     for pdb_path in config.pdbs {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let new_exe_cache = || -> anyhow::Result<ExeCache> {
-                let mut exe_path = pdb_path.clone();
-                exe_path.set_extension("exe");
-                //debug_log.write_fmt(format_args!("{}\n", pdb_path.to_string_lossy()))?;
-
-                let exe_bytes = std::fs::read(&exe_path)?;
-                let cs = Capstone::new().x86().mode(arch::x86::ArchMode::Mode64).build()?;
-                let pdb_file = File::open(&pdb_path)?;
-                let mut pdb = PDB::open(pdb_file)?;
-
-                // Pre-process PDB
-                let di = pdb.debug_information()?;
-                let string_table = pdb.string_table()?;
-                let mut modules = di.modules()?;
-
-                let mut file_name_lower: HashMap<pdb::RawString, String> = Default::default();
-                let mut file_name_excluded: HashSet<pdb::RawString> = Default::default();
-                let mut files: HashMap<String, HashMap<u32, pdb::LineInfo>> = Default::default();
-                while let Some(module) = modules.next()? {
-                    let info = pdb.module_info(&module)?.ok_or_else(|| anyhow::anyhow!("Failed to get PDB module info"));
-
-                    let info = match info {
-                        Ok(i) => i,
-                        Err(_) => {
-                            continue;
-                        }
-                    };
-
-                    let line_program = info.line_program()?;
-
-                    let mut lines = line_program.lines();
-                    while let Some(line) = lines.next()? {
-                        let file_info = line_program.get_file_info(line.file_index)?;
-                        let file_name = string_table.get(file_info.name)?;
-
-                        if file_name_excluded.contains(&file_name) {
-                            continue;
-                        }
-
-                        // Try to ensure entry
-                        if !file_name_lower.contains_key(&file_name) {
-                            if let Ok(pb) = PathBuf::from_str(&file_name.to_string()).unwrap().normalize() {
-                                if let Some(lower) = pb.as_path().to_str().and_then(|s| Some(s.to_lowercase())) {
-                                    //debug_log.write_fmt(format_args!("    {}\n", &lower))?;
-                                    file_name_lower.insert(file_name, lower);
-                                }
-                            } else {
-                                file_name_excluded.insert(file_name.clone());
-                            }
-                        }
-
-                        if let Some(lower) = file_name_lower.get(&file_name) {
-                            if !files.contains_key(lower) {
-                                files.insert(lower.clone(), Default::default());
-                            }
-
-                            files.get_mut(lower).unwrap().insert(line.line_start, line);
-                        }
-                    }
-                }
-
-                // Create SymCache
-                let dsym_path = pdb_path.resolve_dsym();
-                let byteview = ByteView::open(dsym_path.as_deref().unwrap_or_else(|| pdb_path.as_ref()))?;
-
-                let fat_obj = Archive::parse(&byteview)?;
-                let objects_result: Result<Vec<_>, _> = fat_obj.objects().collect();
-                let objects = objects_result?;
-                if objects.len() != 1 {
-                    anyhow::bail!("Error initializing symcache. Expected 1 object found {}", objects.len());
-                }
-                let obj = &objects[0];
-
-                let mut converter = SymCacheConverter::new();
-                converter.process_object(obj)?;
-
-                let mut symcache_bytes = Vec::new();
-                converter.serialize(&mut std::io::Cursor::new(&mut symcache_bytes))?;
-
-                // Construct Cache
-                Ok(ExeCache::new(
-                    ExeCacheOwner {
-                        //exe_path,
-                        exe_bytes: Pin::new(exe_bytes.into_boxed_slice()),
-                        exe_capstone: cs,
-                        pdb_path,
-                        //pdb,
-                        files,
-                        symcache_bytes: Pin::new(symcache_bytes.into_boxed_slice()),
-                    },
-                    |exe_cache| -> ExeCacheRefs {
-                        let pe = PE::parse(&exe_cache.exe_bytes).unwrap();
-
-                        let text_section = pe.sections.iter().find(|s| s.name().unwrap() == ".text").unwrap();
-                        let bytes = &exe_cache.exe_bytes[text_section.pointer_to_raw_data as usize..text_section.size_of_raw_data as usize];
-                        let exe_instructions = exe_cache.exe_capstone.disasm_all(bytes, text_section.virtual_address as u64).unwrap();
-
-                        ExeCacheRefs::new(
-                            ExeCacheRefs1 {
-                                exe_parsed: pe,
-                                exe_instructions,
-                                symcache: SymCache::parse(&exe_cache.symcache_bytes).unwrap(),
-                            },
-                            move |refs| {
-                                let mut exe_instructions_sorted: HashMap<u64, &capstone::Insn> = Default::default();
-                                for inst in refs.exe_instructions.iter() {
-                                    exe_instructions_sorted.insert(inst.address(), inst);
-                                }
-
-                                ExeCacheRefs2 { exe_instructions_sorted }
-                            },
-                        )
-                    },
-                ))
-            }();
-
-            match new_exe_cache {
+            match build_exe_cache(&pdb_path) {
                 Ok(c) => exe_caches.push(c),
                 Err(_e) => {
                     //let _ = debug_log.write_fmt(format_args!("Error: {}\n", _e.to_string()));
@@ -259,6 +148,137 @@ fn build_cache(config: Config) -> anyhow::Result<Cache> {
 
     //debug_log.write_all(b"Build Cache Complete\n")?;
     Ok(Cache { exe_caches })
+}
+
+fn build_exe_cache(pdb_path: &Path) -> anyhow::Result<ExeCache> {
+    let mut exe_path = pdb_path.to_owned();
+    exe_path.set_extension("exe");
+    //debug_log.write_fmt(format_args!("{}\n", pdb_path.to_string_lossy()))?;
+
+    let exe_bytes = std::fs::read(&exe_path)?;
+    let cs = Capstone::new().x86().mode(arch::x86::ArchMode::Mode64).build()?;
+    let pdb_file = File::open(&pdb_path)?;
+    let pdb_last_modified = std::fs::metadata(&pdb_path)?.last_write_time();
+    let mut pdb = PDB::open(pdb_file)?;
+
+    // Pre-process PDB
+    let di = pdb.debug_information()?;
+    let string_table = pdb.string_table()?;
+    let mut modules = di.modules()?;
+
+    let mut file_name_lower: HashMap<pdb::RawString, String> = Default::default();
+    let mut file_name_excluded: HashSet<pdb::RawString> = Default::default();
+    let mut files: HashMap<String, HashMap<u32, pdb::LineInfo>> = Default::default();
+    while let Some(module) = modules.next()? {
+        let info = pdb.module_info(&module)?.ok_or_else(|| anyhow::anyhow!("Failed to get PDB module info"));
+
+        let info = match info {
+            Ok(i) => i,
+            Err(_) => {
+                continue;
+            }
+        };
+
+        let line_program = info.line_program()?;
+
+        let mut lines = line_program.lines();
+        while let Some(line) = lines.next()? {
+            let file_info = line_program.get_file_info(line.file_index)?;
+            let file_name = string_table.get(file_info.name)?;
+
+            if file_name_excluded.contains(&file_name) {
+                continue;
+            }
+
+            // Try to ensure entry
+            if !file_name_lower.contains_key(&file_name) {
+                if let Ok(pb) = PathBuf::from_str(&file_name.to_string()).unwrap().normalize() {
+                    if let Some(lower) = pb.as_path().to_str().and_then(|s| Some(s.to_lowercase())) {
+                        //debug_log.write_fmt(format_args!("    {}\n", &lower))?;
+                        file_name_lower.insert(file_name, lower);
+                    }
+                } else {
+                    file_name_excluded.insert(file_name.clone());
+                }
+            }
+
+            if let Some(lower) = file_name_lower.get(&file_name) {
+                if !files.contains_key(lower) {
+                    files.insert(lower.clone(), Default::default());
+                }
+
+                files.get_mut(lower).unwrap().insert(line.line_start, line);
+            }
+        }
+    }
+
+    // Create SymCache
+    let dsym_path = pdb_path.resolve_dsym();
+    let byteview = ByteView::open(dsym_path.as_deref().unwrap_or_else(|| pdb_path.as_ref()))?;
+
+    let fat_obj = Archive::parse(&byteview)?;
+    let objects_result: Result<Vec<_>, _> = fat_obj.objects().collect();
+    let objects = objects_result?;
+    if objects.len() != 1 {
+        anyhow::bail!("Error initializing symcache. Expected 1 object found {}", objects.len());
+    }
+    let obj = &objects[0];
+
+    let mut converter = SymCacheConverter::new();
+    converter.process_object(obj)?;
+
+    let mut symcache_bytes = Vec::new();
+    converter.serialize(&mut std::io::Cursor::new(&mut symcache_bytes))?;
+
+    // Construct Cache
+    Ok(ExeCache::new(
+        ExeCacheOwner {
+            //exe_path,
+            exe_bytes: Pin::new(exe_bytes.into_boxed_slice()),
+            exe_capstone: cs,
+            pdb_path: pdb_path.to_owned(),
+            pdb_last_modified,
+            files,
+            symcache_bytes: Pin::new(symcache_bytes.into_boxed_slice()),
+        },
+        |exe_cache| -> ExeCacheRefs {
+            let pe = PE::parse(&exe_cache.exe_bytes).unwrap();
+
+            let text_section = pe.sections.iter().find(|s| s.name().unwrap() == ".text").unwrap();
+            let bytes = &exe_cache.exe_bytes[text_section.pointer_to_raw_data as usize..text_section.size_of_raw_data as usize];
+            let exe_instructions = exe_cache.exe_capstone.disasm_all(bytes, text_section.virtual_address as u64).unwrap();
+
+            ExeCacheRefs::new(
+                ExeCacheRefs1 {
+                    exe_parsed: pe,
+                    exe_instructions,
+                    symcache: SymCache::parse(&exe_cache.symcache_bytes).unwrap(),
+                },
+                move |refs| {
+                    let mut exe_instructions_sorted: HashMap<u64, &capstone::Insn> = Default::default();
+                    for inst in refs.exe_instructions.iter() {
+                        exe_instructions_sorted.insert(inst.address(), inst);
+                    }
+
+                    ExeCacheRefs2 { exe_instructions_sorted }
+                },
+            )
+        },
+    ))
+}
+
+fn refresh_cache(cache: &mut Cache) {
+    for exe_cache in &mut cache.exe_caches {
+        let _ = (|| -> anyhow::Result<()> {
+            let pdb_last_modified = std::fs::metadata(&exe_cache.borrow_owner().pdb_path)?.last_write_time();
+            let ec = exe_cache.borrow_owner();
+            if pdb_last_modified > ec.pdb_last_modified {
+                *exe_cache = build_exe_cache(&ec.pdb_path)?;
+            }
+
+            Ok(())
+        })();
+    }
 }
 
 async fn handle_request(req: Request, connection: &Connection, cache: &Option<Cache>) {

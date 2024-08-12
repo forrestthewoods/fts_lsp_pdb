@@ -18,3 +18,4 @@ symbolic = { version = "12.10.0", features = ["symcache"] }
 url = "2.5.0"
 self_cell = "1.0.4"
 itertools = "0.13.0"
+rayon = "1.10.0"

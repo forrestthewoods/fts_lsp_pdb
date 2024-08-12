@@ -6,6 +6,7 @@ use lsp_server::{Connection, Message, Request, Response};
 use lsp_types::{GotoDefinitionParams, GotoDefinitionResponse, InitializeResult, Position, ServerCapabilities};
 use normpath::PathExt;
 use pdb::{FallibleIterator, PDB};
+use rayon::iter::{ParallelIterator, IntoParallelRefIterator};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::os::windows::fs::MetadataExt;
@@ -125,24 +126,22 @@ fn main() {
     });
 }
 
+unsafe impl Send for ExeCache {}
+
 fn build_cache(config: Config) -> anyhow::Result<Cache> {
     //let mut debug_log = std::fs::OpenOptions::new().create(true).append(true).open("c:/temp/hack_log.txt")?;
 
-    let mut exe_caches: Vec<ExeCache> = Default::default();
-
-    for pdb_path in config.pdbs {
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match build_exe_cache(&pdb_path) {
-            Ok(c) => exe_caches.push(c),
-            Err(_e) => {
-                // let _ = debug_log.write_fmt(format_args!("Error: {}\n", _e.to_string()));
+    let exe_caches : Vec<ExeCache> = config.pdbs.par_iter().filter_map(|pdb_path : &PathBuf| {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build_exe_cache(&pdb_path)));
+        match result {
+            Ok(inner_result) => inner_result.ok(),
+            Err(err) => {
+                let _panic_msg = get_panic_msg(&err);
+                //debug_log.write_fmt(format_args!("PANIC! {}\n", _panic_msg))?;
+                None
             }
-        }));
-
-        if let Err(err) = result {
-            let _panic_msg = get_panic_msg(&err);
-            //debug_log.write_fmt(format_args!("PANIC! {}\n", _panic_msg))?;
         }
-    }
+    }).collect();
 
     //debug_log.write_all(b"Build Cache Complete\n")?;
     Ok(Cache { exe_caches })

@@ -1,13 +1,46 @@
-This project is modified from the Microsoft VSCode Extension sample: https://code.visualstudio.com/api/language-extensions/language-server-extension-guide
+`fts-lsp-pdb` provides `goto definition` support for compiled languages that produce `PDB` debug symbols.
 
-## Running the Sample
+![](media/goto_definition_multilang.mp4)
 
-- Run `npm install` in this folder. This installs all necessary npm modules in both the client and server folder
-- Open VS Code on this folder.
-- Press Ctrl+Shift+B to start compiling the client and server in [watch mode](https://code.visualstudio.com/docs/editor/tasks#:~:text=The%20first%20entry%20executes,the%20HelloWorld.js%20file.).
-- Switch to the Run and Debug View in the Sidebar (Ctrl+Shift+D).
-- Select `Launch Client` from the drop down (if it is not already).
-- Press ▷ to run the launch config (F5).
-- In the [Extension Development Host](https://code.visualstudio.com/api/get-started/your-first-extension#:~:text=Then%2C%20inside%20the%20editor%2C%20press%20F5.%20This%20will%20compile%20and%20run%20the%20extension%20in%20a%20new%20Extension%20Development%20Host%20window.) instance of VSCode, open a document in 'plain text' language mode.
-  - Type `j` or `t` to see `Javascript` and `TypeScript` completion.
-  - Enter text content such as `AAA aaa BBB`. The extension will emit diagnostics for all words in all-uppercase.
+# Supported Platforms
+Only runs on Windows and with projects that had a PDB file.
+
+# Supported Languages
+Any compiled language that produces `.pdb` debug symbols
+
+Verified to work with: C, C++, Rust, Zig, Odin, Nim, Jai
+Known Issues: D
+
+# Configuration
+Your project needs to be configured so that the extension knows what file types to consider and where `.pdb` files are located.
+
+In `settings.json`:
+
+```json
+"fts_lsp_pdb.languages": ["cpp"],
+"fts_lsp_pdb.file_patterns": [
+    "**/*.zig", 
+    "**/*.jai",
+    "**/*.odin",
+    "**/*.nim",
+    "**/*.rs",
+],
+"fts_lsp_pdb.pdbs": [
+    "path/to/foo.pdb",
+    "path/to/some/other/bar.pdb",
+],
+```
+
+You can find a list of supported language identifiers in the [VSCode documentation](https://code.visualstudio.com/docs/languages/identifiers).
+
+# Known Limitations
+
+The limitations of this extension are numerous:
+
+* Only works with function calls
+* Doesn't support inline functions or macros
+* Only supports Windows and `.pdb` debug symbols
+* Untested with `.dlls`
+* Required making a full debug build to produce a `.pdb`
+* Only tested on small projects
+* Doesn't implement any LSP feature except `GotoDefinition`

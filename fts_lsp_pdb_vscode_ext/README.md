@@ -1,6 +1,6 @@
 `fts-lsp-pdb` provides `goto definition` support for compiled languages that produce `PDB` debug symbols.
 
-![](media/goto_definition_multilang.mp4)
+![](media/goto_definition_multilang.gif)
 
 # Supported Platforms
 Only runs on Windows and with projects that had a PDB file.
